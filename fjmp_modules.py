@@ -285,9 +285,6 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
 
         self.leaky_relu = nn.LeakyReLU(0.2)
 
-        ### NOTE: this is not used...
-        self.dist = MLP(2, self.config["h_dim"])
-
         self.agenttype_enc = Linear(2 * self.config["num_agenttypes"], self.config["h_dim"])
         self.encode_preds = LinearRes(2 * config["prediction_steps"], self.config['h_dim'])
         self.fc_agg = nn.GRUCell(self.config["h_dim"], self.config["h_dim"])
@@ -322,7 +319,8 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
             pred_future_relative = edges.src['f_decode'].detach() - ctrs_reactors
             ground_truth_futures = edges.src['ground_truth_futures'].to(ctrs_reactors.device)
             ground_truth_futures_relative = torch.stack([ground_truth_futures] * self.config["num_joint_modes"], dim=2).transpose(1,2) - ctrs_reactors
-            pred_future_relative[edges.data['use_ground_truth'] == 1] = ground_truth_futures_relative[edges.data['use_ground_truth'] == 1]
+            #for teacher forcing, use_ground_truth is an array of all 1s so its the same as replacing for all edges 
+            pred_future_relative[edges.data['use_ground_truth'] == 1] = ground_truth_futures_relative[edges.data['use_ground_truth'] == 1] 
         else:
             pred_future_relative = edges.src['f_decode'].detach() - ctrs_reactors
         

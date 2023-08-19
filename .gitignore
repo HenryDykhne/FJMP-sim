@@ -1,1 +1,4 @@
 /dataset_INTERACTION/*
+/logs/*
+*.pyc
+/misc/log

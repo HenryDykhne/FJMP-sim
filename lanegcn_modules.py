@@ -282,22 +282,25 @@ class Att(nn.Module):
             wi.append(idcs[:, 1] + wi_count)
             hi_count += len(agt_idcs[i])
             wi_count += len(ctx_idcs[i])
-        hi = torch.cat(hi, 0)
-        wi = torch.cat(wi, 0)
 
-        agt_ctrs = torch.cat(agt_ctrs, 0)
-        ctx_ctrs = torch.cat(ctx_ctrs, 0)
-        dist = agt_ctrs[hi] - ctx_ctrs[wi]
-        dist = self.dist(dist)
+        if len(hi) != 0 and len(wi) != 0:
+            hi = torch.cat(hi, 0) # put this in if statement to avoid crash if no agents are close enough and the list is empty
+            wi = torch.cat(wi, 0)
 
-        query = self.query(agts[hi])
+            agt_ctrs = torch.cat(agt_ctrs, 0)
+            ctx_ctrs = torch.cat(ctx_ctrs, 0)
+            dist = agt_ctrs[hi] - ctx_ctrs[wi]
+            dist = self.dist(dist)
 
-        ctx = ctx[wi]
-        ctx = torch.cat((dist, query, ctx), 1)
-        ctx = self.ctx(ctx)
+            query = self.query(agts[hi])
+
+            ctx = ctx[wi]
+            ctx = torch.cat((dist, query, ctx), 1)
+            ctx = self.ctx(ctx)
 
         agts = self.agt(agts)
-        agts.index_add_(0, hi, ctx)
+        if len(hi) != 0 and len(wi) != 0:
+            agts.index_add_(0, hi, ctx) # put this in if statement to avoid crash if no agents are close enough and the list is empty
         agts = self.norm(agts)
         agts = self.relu(agts)
 

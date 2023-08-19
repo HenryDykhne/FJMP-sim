@@ -1,1 +1,0 @@
-Directory to store INTERACTION dataset and preprocessed data.

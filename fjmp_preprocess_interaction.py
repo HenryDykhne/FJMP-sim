@@ -68,7 +68,7 @@ def main():
     config['dataset_path'] = 'dataset_INTERACTION'
     config['tracks_train_reformatted'] = os.path.join(config['dataset_path'], 'train_reformatted')
     config['tracks_val_reformatted'] = os.path.join(config['dataset_path'], 'val_reformatted')
-    config['maps'] = 'dataset_INTERACTION/maps'
+    config['maps'] = os.path.join(config['dataset_path'], 'maps')
     config['num_scales'] = 6
     config["preprocess"] = False 
     config["val_workers"] = 0 
@@ -431,5 +431,5 @@ def preprocess(graph, cross_dist, cross_angle=None):
     out['idx'] = graph['idx']
     return out
 
-main()
+#main()
 

@@ -742,7 +742,15 @@ class FJMP(torch.nn.Module):
 
         return stage_1_graph
 
-    def forward(self, scene_idxs, graph, stage_1_graph, ig_dict, batch_idxs, batch_idxs_edges, actor_ctrs, ks=None, prop_ground_truth = 0., eval=True):
+    def viz_interaction_graph(self, graph, idx):
+        G = dgl.to_networkx(graph.cpu(), node_attrs=None, edge_attrs=None) 
+        pos = nx.spring_layout(G)
+        plt.figure(figsize=[15,7]) 
+        nx.draw(G, pos, with_labels = True)
+        plt.savefig('img/dag_{}_nocycles.png'.format(idx))
+        plt.clf()
+
+    def forward(self, scene_idxs, graph, stage_1_graph, ig_dict, batch_idxs, batch_idxs_edges, actor_ctrs, ks=None, prop_ground_truth = 0., eval=True, idx_for_img = -1):
         
         if self.learned_relation_header:
             edge_logits = self.relation_header(graph)
@@ -777,7 +785,8 @@ class FJMP(torch.nn.Module):
         
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
             loc_pred = self.trajectory_decoder(dag_graph, prop_ground_truth, batch_idxs)
-        
+        if idx_for_img != -1:
+            self.viz_interaction_graph(dag_graph, idx_for_img)##################################################################
         # loc_pred: shape [N, prediction_steps, num_joint_modes, 2]
         res = {}
 
