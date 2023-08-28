@@ -338,29 +338,157 @@ class FJMP(torch.nn.Module):
             
             tot = 0
             accum_gradients = {}
+            random.seed(0)
             for i, data in enumerate(train_loader):      
 
                 # get data dictionary for processing batch
                 dd = self.process(data)
 
-                dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
-                # only process observed features
-                dgl_graph = self.feature_encoder(dgl_graph, dd['feats'][:,:self.observation_steps], dd['agenttypes'], dd['actor_idcs'], dd['actor_ctrs'], dd['lane_graph'])
+                if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
+                    loss = 0
+                    start_timestep = 0
+                    sum_timesteps_across_rollouts = 0
 
-                if self.two_stage_training and self.training_stage == 2:
-                    stage_1_graph = self.build_stage_1_graph(dgl_graph, dd['feats'][:,:self.observation_steps], dd['agenttypes'], dd['actor_idcs'], dd['actor_ctrs'], dd['lane_graph'])
+                    ctrs = dd['ctrs']
+                    world_locs = dd['world_locs'] # location features (not offsets but absolute positions in SE(2)-transformed coordinate system) (past + future)
+                    actor_ctrs = dd['actor_ctrs'] # just the actor centers
+                    feats = dd['feats'][:,:self.observation_steps]
+
+                    has_preds = dd['has_preds']
+                    gt_locs = dd['gt_locs']
+                    gt_psirads = dd['gt_psirads']
+                    gt_vels = dd['gt_vels']
+
+                    while start_timestep < config['prediction_steps']:
+                        dgl_graph = self.init_dgl_graph(dd['batch_idxs'], ctrs, dd['orig'], dd['rot'], dd["agenttypes"], world_locs, has_preds).to(dev)
+                        # only process observed features
+                        dgl_graph = self.feature_encoder(dgl_graph, feats, dd['agenttypes'], dd['actor_idcs'], actor_ctrs, dd['lane_graph'])
+
+                        if self.two_stage_training and self.training_stage == 2:
+                            stage_1_graph = self.build_stage_1_graph(dgl_graph, feats, dd['agenttypes'], dd['actor_idcs'], actor_ctrs, dd['lane_graph'])
+                        else:
+                            stage_1_graph = None
+
+                        ig_dict = {}
+                        ig_dict["ig_labels"] = None
+                        
+                        # produces dictionary of results
+                        res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=prop_ground_truth, eval=False)
+
+                        loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], has_preds, gt_locs, gt_psirads, gt_vels, dd['batch_size'], dd["ig_labels"], epoch)
+                        
+                        sum_timesteps_across_rollouts += (config['prediction_steps'] - start_timestep) # this term deals with the fact that some runs will attend over the same timestep multiple times. the sum of timesteps predicted is saved.
+                        loss += loss_dict["total_loss"] # we total up the loss from each run.
+
+                        #here, we need to take the information to generate the starting position for the next step of the rollout
+                        steps_before_replan = random.randint(1, config['prediction_steps']) #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
+                        start_timestep += steps_before_replan
+
+                        padding = (0, 0, 0, steps_before_replan)
+                        pred_padding = (0, steps_before_replan)
+
+                        has_preds = has_preds[:, steps_before_replan:]
+                        gt_locs = gt_locs[:, steps_before_replan:]
+                        gt_psirads = gt_psirads[:, steps_before_replan:]
+                        gt_vels = gt_vels[:, steps_before_replan:]
+
+
+                        has_preds = F.pad(has_preds, pred_padding, "constant", 0) # padding with zeroes
+                        gt_locs = F.pad(gt_locs, padding, "constant", 0) # padding with zeroes
+                        gt_psirads = F.pad(gt_psirads, padding, "constant", 0) # padding with zeroes
+                        gt_vels = F.pad(gt_vels, padding, "constant", 0) # padding with zeroes
+
+                        argmin = loss_dict['argmin']
+                        print(argmin)
+                        print(argmin.size())
+                        print(res['loc_pred'].size())
+                        print(res['head_pred'].size())
+                        print(res['vel_pred'].size())
+ 
+                        print('ctrs', ctrs.size())
+                        print('world_locs', world_locs.size())
+                        print('actor_ctrs', len(actor_ctrs))
+                        print('feats', feats.size())
+
+                        
+                        # rotate things back into the SE-2 reference frame
+                        res['loc_pred'] = torch.matmul(res['loc_pred'].cpu() - dd['orig'].view(-1, 1, 1, 2), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        res['head_pred'] = torch.matmul(res['head_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        res['vel_pred'] = torch.matmul(res['vel_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        # convert heading back into a rad
+                        res['head_pred'] = torch.atan2(res['head_pred'][:, :, :, 1], res['head_pred'][:, :, :, 0]).unsqueeze(3) #first is y second is x
+ 
+                        
+
+                        # we want the first number in argmin to be repeated the number of times indicated in the first index of 'dgl_graph.batch_num_nodes()'
+                        repeated_argmins = argmin.repeat_interleave(dgl_graph.batch_num_nodes())
+                        print(repeated_argmins.size())
+                        
+                        # Generate the indices for advanced indexing
+                        vehicle_indices = torch.arange(res['loc_pred'].size(0)).unsqueeze(1)
+                        time_indices = torch.arange(res['loc_pred'].size(1)).unsqueeze(0)
+                        mode_indices = repeated_argmins.unsqueeze(1) # IMPORTANT: right now, this is selecting the best mode, not the best mode up to time of replanning.!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                        #FIXTHIS !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+                        # Use advanced indexing to select the desired elements
+                        best_loc = res['loc_pred'][vehicle_indices, time_indices, mode_indices]
+                        best_head = res['head_pred'][vehicle_indices, time_indices, mode_indices]
+                        best_vel = res['vel_pred'][vehicle_indices, time_indices, mode_indices]
+
+                        ctrs = best_loc[:, steps_before_replan] #these lines grabs the best ctrs with the appropriate timeshift
+
+                        world_locs = world_locs[:, :config['observation_steps']]
+                        a = world_locs[:, steps_before_replan:]
+                        q = max(steps_before_replan-config['observation_steps'], 0)#for example, if we jump forward 15 steps and our obs horizon is only 10, we should drop the first 5 steps in the predictions when constructing our new obs
+                        b = best_loc[:, q:]
+
+                        world_locs = torch.cat([a.to(dev), b.to(dev)], dim = 1)
+                        world_locs = world_locs[:, :config['observation_steps']]
+
+                        j = 0
+                        for s, num_in_scene in enumerate(dgl_graph.batch_num_nodes()):
+                            actor_ctrs[s] = best_loc[j:j+num_in_scene, steps_before_replan]
+                            j+=num_in_scene
+
+                        new_feats = torch.cat([best_loc, best_vel, best_head], dim=2)
+
+                        feats = feats[:, :config['observation_steps']] #same trick as up above
+                        a = feats[:, steps_before_replan:]
+                        b = new_feats[:, q:]
+                        print('b', b.size())
+                        feats = torch.cat([a.to(dev), b.to(dev)], dim = 1)
+                        feats = feats[:, :config['observation_steps']]
+
+                        print('ctrs', ctrs.size())
+                        print('world_locs', world_locs.size())
+                        print('actor_ctrs', len(actor_ctrs))
+                        print('feats', feats.size())
+                        exit()
+
+                        
+                    
+                    norm_term = sum_timesteps_across_rollouts / config['prediction_steps'] # play with this. it might be helping or hurting.
+                    loss = loss * norm_term
                 else:
-                    stage_1_graph = None
+                    dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
+                    # only process observed features
+                    dgl_graph = self.feature_encoder(dgl_graph, dd['feats'][:,:self.observation_steps], dd['agenttypes'], dd['actor_idcs'], dd['actor_ctrs'], dd['lane_graph'])
 
-                ig_dict = {}
-                ig_dict["ig_labels"] = dd["ig_labels"] 
-                
-                # produces dictionary of results
-                res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=prop_ground_truth, eval=False)
+                    if self.two_stage_training and self.training_stage == 2:
+                        stage_1_graph = self.build_stage_1_graph(dgl_graph, dd['feats'][:,:self.observation_steps], dd['agenttypes'], dd['actor_idcs'], dd['actor_ctrs'], dd['lane_graph'])
+                    else:
+                        stage_1_graph = None
 
-                loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['has_preds'], dd['gt_locs'], dd['batch_size'], dd["ig_labels"], epoch)
-                
-                loss = loss_dict["total_loss"]
+                    ig_dict = {}
+                    ig_dict["ig_labels"] = dd["ig_labels"] 
+                    
+                    # produces dictionary of results
+                    res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=prop_ground_truth, eval=False)
+
+                    loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['has_preds'], dd['gt_locs'], dd['batch_size'], dd["ig_labels"], epoch)
+                    
+                    loss = loss_dict["total_loss"]
+
                 optimizer.zero_grad()
                 loss.backward()
                 accum_gradients = accumulate_gradients(accum_gradients, self.named_parameters())
@@ -526,7 +654,7 @@ class FJMP(torch.nn.Module):
                 
                 res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=0., eval=True)
 
-                loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['has_preds'], dd['gt_locs'], dd['batch_size'], dd["ig_labels"], epoch)
+                loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['has_preds'], dd['gt_locs'], dd['gt_psirads'], dd['gt_vels'], dd['batch_size'], dd["ig_labels"], epoch)
                 
                 if i % 50 == 0:
                     print_("Validation data: ", "{:.2f}%".format(i * 100 / tot_log), "\t".join([k + ":" + f"{v.item():.3f}" for k, v in loss_dict.items()]))
@@ -565,7 +693,7 @@ class FJMP(torch.nn.Module):
         print_('Calculating validation metrics...')
         
         has_last_mask = np.concatenate(has_last_all, axis=0).astype(bool)
-        if self.dataset=='interaction':
+        if self.config['supervise_vehicles'] == True:
             # only evaluate vehicles
             eval_agent_mask = np.concatenate(agenttypes_all, axis=0)[:, 1].astype(bool)
         else:
@@ -784,8 +912,9 @@ class FJMP(torch.nn.Module):
             dag_graph, proposals = self.proposal_decoder(dag_graph, actor_ctrs)
         
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
-            loc_pred = self.trajectory_decoder(dag_graph, prop_ground_truth, batch_idxs)
-        if idx_for_img != -1:
+            loc_pred, head_pred, vel_pred = self.trajectory_decoder(dag_graph, prop_ground_truth, batch_idxs)
+
+        if idx_for_img != -1: #draws the interaction graph
             self.viz_interaction_graph(dag_graph, idx_for_img)##################################################################
         # loc_pred: shape [N, prediction_steps, num_joint_modes, 2]
         res = {}
@@ -794,7 +923,10 @@ class FJMP(torch.nn.Module):
             res["proposals"] = proposals # trajectory proposal future coordinates
         
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
+            ### IMPORTANT: I think this line needs to be made into 3 lines, one for each of the heads (position, heading, velocity)
             res["loc_pred"] = loc_pred # predicted future coordinates
+            res["head_pred"] = head_pred
+            res["vel_pred"] = vel_pred
         
         if self.learned_relation_header:
             res["edge_logits"] = edge_logits.float() # edge probabilities for computing BCE loss    
@@ -802,7 +934,7 @@ class FJMP(torch.nn.Module):
         
         return res
 
-    def get_loss(self, graph, batch_idxs, res, agenttypes, has_preds, gt_locs, batch_size, ig_labels, epoch):
+    def get_loss(self, graph, batch_idxs, res, agenttypes, has_preds, gt_locs, gt_psirads, gt_vels, batch_size, ig_labels, epoch):
         
         huber_loss = nn.HuberLoss(reduction='none')
         
@@ -855,6 +987,8 @@ class FJMP(torch.nn.Module):
             has_preds_mask = has_preds_mask.expand(has_preds_mask.shape[0], has_preds_mask.shape[1], self.num_joint_modes, 2).bool().to(dev)
             
             loc_pred = res["loc_pred"]
+            head_pred = res["head_pred"]
+            vel_pred = res["vel_pred"]
             
             if not self.proposal_header:
                 if self.supervise_vehicles and self.dataset=='interaction':
@@ -867,30 +1001,39 @@ class FJMP(torch.nn.Module):
             
             has_preds_mask = has_preds_mask[vehicle_mask]
             loc_pred = loc_pred[vehicle_mask]
+            head_pred = head_pred[vehicle_mask]
+            vel_pred = vel_pred[vehicle_mask]
             
             target = torch.stack([gt_locs] * self.num_joint_modes, dim=2).to(dev)
+            target_heading = torch.stack([gt_psirads] * self.num_joint_modes, dim=2).to(dev)
+            assert target_heading.size(dim=3) == 1
+            target_heading = torch.cat([torch.cos(target_heading), torch.sin(target_heading)], dim=3) #double check this
+            assert target_heading.size(dim=3) == 2
+            target_vel = torch.stack([gt_vels] * self.num_joint_modes, dim=2).to(dev)
 
             # Regression loss
-            reg_loss = huber_loss(loc_pred, target)
+            reg_loss = huber_loss(loc_pred, target) + huber_loss(head_pred, target_heading) + huber_loss(vel_pred, target_vel)
 
             # 0 out loss for the indices that don't have a ground-truth prediction.
             reg_loss = reg_loss * has_preds_mask
 
             b_s = torch.zeros((batch_size, self.num_joint_modes)).to(reg_loss.device)
             count = 0
-            for i, batch_num_nodes_i in enumerate(graph.batch_num_nodes()):
+            for i, batch_num_nodes_i in enumerate(graph.batch_num_nodes()):# batch num nodes returns the number of nodes for each graph (scenario) in the batch
                 batch_num_nodes_i = batch_num_nodes_i.item()
                 
                 batch_reg_loss = reg_loss[count:count+batch_num_nodes_i]    
                 # divide by number of agents in the scene        
-                b_s[i] = torch.sum(batch_reg_loss, (0, 1, 3)) / batch_num_nodes_i
+                b_s[i] = torch.sum(batch_reg_loss, (0, 1, 3)) / batch_num_nodes_i # here we sum across each mode. this gives us the loss by mode for each graph (scenario) in the batch, normalized by the number of nodes
 
                 count += batch_num_nodes_i
 
             # sanity check
             assert batch_size == (i + 1)
-
-            loss_reg = torch.min(b_s, dim=1)[0].mean()      
+            min_package = torch.min(b_s, dim=1) #here, we take the min for each mode from each batch
+            min = min_package[0] # this part is the min
+            argmin = min_package[1] # this part is the argmin
+            loss_reg = min.mean() #  we then take the mean of the mins. this forms our "winner takes all" loss
 
         # Relation Loss
         if self.learned_relation_header:
@@ -948,7 +1091,7 @@ class FJMP(torch.nn.Module):
                              
                 if self.proposal_header:
                     loss_dict["loss_prop_reg"] = loss_prop_reg * self.proposal_coef
-        
+        loss_dict["argmin"] = argmin
         return loss_dict
 
     def save_current_epoch(self, epoch, optimizer, val_best, ade_best, fde_best):

@@ -558,7 +558,7 @@ class InteractionDataset(Dataset):
             
             # center and rotate positions, rotate velocities
             feat[step] = np.matmul(rot, (traj - orig.reshape(-1, 2)).T).T
-            feat_vel[step] = np.matmul(rot, vel.T).T
+            feat_vel[step] = np.matmul(rot, vel.T).T ### IMPORTANT: this is how to rotate velocities!!!
 
             # recalculate yaw angles
             feat_agenttype[step] = agenttype

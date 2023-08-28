@@ -291,6 +291,14 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
         self.f_out = nn.Sequential(
                 LinearRes(self.config['h_dim'] + self.config["num_joint_modes"], self.config['h_dim']),
                 nn.Linear(self.config['h_dim'], 2 * config["prediction_steps"]),
+            )
+        self.h_out = nn.Sequential(#for the heading (we predict heading as xy vectors and later on we will convert it to psirads)
+                LinearRes(self.config['h_dim'] + self.config["num_joint_modes"], self.config['h_dim']),
+                nn.Linear(self.config['h_dim'], 2 * config["prediction_steps"]),
+            )  
+        self.v_out = nn.Sequential(#for the velocity
+                LinearRes(self.config['h_dim'] + self.config["num_joint_modes"], self.config['h_dim']),
+                nn.Linear(self.config['h_dim'], 2 * config["prediction_steps"]),
             )  
 
         self.init_weights()
@@ -355,13 +363,22 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
         out = torch.cat([v_n, mode_idx], dim=-1)  
 
         preds = []
+        h_preds = []
+        v_preds = []
         for i in range(self.config["num_joint_modes"]):
-            preds.append(self.f_out(out[:, i, :]))  
+            preds.append(self.f_out(out[:, i, :]))
+            h_preds.append(self.h_out(out[:, i, :]))  
+            v_preds.append(self.v_out(out[:, i, :]))  
 
         dests = torch.cat([x.unsqueeze(1) for x in preds], 1)
-        f_decode = dests.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2) + nodes.data["ctrs"].view(-1, 1, 1, 2)      
+        heads = torch.cat([x.unsqueeze(1) for x in h_preds], 1)
+        vels = torch.cat([x.unsqueeze(1) for x in v_preds], 1)
 
-        return {'v_n': v_n, 'f_decode': f_decode}         
+        f_decode = dests.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2) + nodes.data["ctrs"].view(-1, 1, 1, 2)      
+        h_decode = heads.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2)
+        v_decode = vels.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2)
+
+        return {'v_n': v_n, 'f_decode': f_decode, 'h_decode': h_decode, 'v_decode': v_decode}         
 
     def apply_source_nodes(self, graph):
         # first retrieve the topological order
@@ -379,13 +396,26 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
         for mode in range(self.config["num_joint_modes"]):
             mode_idx[:, mode, mode] = 1.
         out = torch.cat([v_n, mode_idx], dim=-1)
+        
         preds = []
+        h_preds = []
+        v_preds = []
         for i in range(self.config["num_joint_modes"]):
             preds.append(self.f_out(out[:, i, :]))
+            h_preds.append(self.h_out(out[:, i, :]))  
+            v_preds.append(self.v_out(out[:, i, :]))  
 
         dests = torch.cat([x.unsqueeze(1) for x in preds], 1)
-        f_decode = dests.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2) + graph.ndata["ctrs"][source_node_idxs].view(-1, 1, 1, 2)
+        heads = torch.cat([x.unsqueeze(1) for x in h_preds], 1)
+        vels = torch.cat([x.unsqueeze(1) for x in v_preds], 1)
+
+        f_decode = dests.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2) +  graph.ndata["ctrs"][source_node_idxs].view(-1, 1, 1, 2)
+        h_decode = heads.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2)
+        v_decode = vels.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2)
+
         graph.ndata["f_decode"][source_node_idxs] = f_decode
+        graph.ndata["h_decode"][source_node_idxs] = h_decode
+        graph.ndata["v_decode"][source_node_idxs] = v_decode
 
         return graph
 
@@ -400,6 +430,8 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
             # This contains our predictions
             # [N, best_N, prediction_steps, 2]
             graph.ndata["f_decode"] = torch.zeros(graph.ndata["xt_enc"].shape[0], self.config["num_joint_modes"], self.config["prediction_steps"], 2).to(graph.ndata["v_n"].device)
+            graph.ndata["h_decode"] = torch.zeros(graph.ndata["xt_enc"].shape[0], self.config["num_joint_modes"], self.config["prediction_steps"], 2).to(graph.ndata["v_n"].device)
+            graph.ndata["v_decode"] = torch.zeros(graph.ndata["xt_enc"].shape[0], self.config["num_joint_modes"], self.config["prediction_steps"], 2).to(graph.ndata["v_n"].device)
             
             # First apply function to source nodes
             graph = self.apply_source_nodes(graph)        
@@ -416,8 +448,16 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
                                 reduce_func=self.reduce_func)
 
             f_decode = graph.ndata.pop("f_decode")
+            h_decode = graph.ndata.pop("h_decode")
+            v_decode = graph.ndata.pop("v_decode")
+
             pred_loc = torch.matmul(f_decode, graph.ndata["rot"].unsqueeze(1)) + graph.ndata["orig"].view(-1, 1, 1, 2)
+            pred_head = torch.matmul(h_decode, graph.ndata["rot"].unsqueeze(1)) 
+            pred_vel = torch.matmul(v_decode, graph.ndata["rot"].unsqueeze(1)) 
+
             pred_loc = pred_loc.transpose(1, 2)
+            pred_head = pred_head.transpose(1, 2)
+            pred_vel = pred_vel.transpose(1, 2)
         
         # special case when we have an empty dgl graph
         else:
@@ -428,18 +468,31 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
             out = torch.cat([v_n, mode_idx], dim=-1)  
 
             preds = []
+            h_preds = []
+            v_preds = []
             for i in range(self.config["num_joint_modes"]):
-                preds.append(self.f_out(out[:, i, :]))      
+                preds.append(self.f_out(out[:, i, :]))
+                h_preds.append(self.h_out(out[:, i, :]))  
+                v_preds.append(self.v_out(out[:, i, :]))    
             
             dests = torch.cat([x.unsqueeze(1) for x in preds], 1)
-            
-            f_decode = dests.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2) + graph.ndata["ctrs"].view(-1, 1, 1, 2)
+            heads = torch.cat([x.unsqueeze(1) for x in h_preds], 1)
+            vels = torch.cat([x.unsqueeze(1) for x in v_preds], 1)
+
+            f_decode = dests.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2) + graph.ndata["ctrs"].view(-1, 1, 1, 2)      
+            h_decode = heads.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2)
+            v_decode = vels.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2)
             
             pred_loc = torch.matmul(f_decode, graph.ndata["rot"].unsqueeze(1)) + graph.ndata["orig"].view(-1, 1, 1, 2)
+            pred_head = torch.matmul(h_decode, graph.ndata["rot"].unsqueeze(1)) 
+            pred_vel = torch.matmul(v_decode, graph.ndata["rot"].unsqueeze(1)) 
+
             pred_loc = pred_loc.transpose(1, 2)
+            pred_head = pred_head.transpose(1, 2)
+            pred_vel = pred_vel.transpose(1, 2)
         
         # [N, prediction_steps, num_joint_modes, 2]
-        return pred_loc
+        return pred_loc, pred_head, pred_vel
 
 class LaneGCNHeader(nn.Module):
     def __init__(self, config):
