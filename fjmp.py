@@ -300,8 +300,9 @@ class FJMP(torch.nn.Module):
     def _train(self, train_loader, val_loader, optimizer, start_epoch, val_best, ade_best, fde_best, val_edge_acc_best):        
         hvd.broadcast_parameters(self.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-
+        
         for epoch in range(start_epoch, self.max_epochs + 1):   
+            random.seed(0)
             # this shuffles the training set every epoch         
             train_loader.sampler.set_epoch(int(epoch))
             
@@ -338,11 +339,11 @@ class FJMP(torch.nn.Module):
             
             tot = 0
             accum_gradients = {}
-            random.seed(0)
+
             inner_loops = 0
             outer_loops = 0
             for i, data in enumerate(train_loader):      
-
+                #random.seed(hvd.rank() * 100 + i * 10)
                 # get data dictionary for processing batch
                 dd = self.process(data)
 
@@ -366,7 +367,7 @@ class FJMP(torch.nn.Module):
                     gt_psirads = dd['gt_psirads']
                     gt_vels = dd['gt_vels']
 
-                    while start_timestep < config['prediction_steps']:
+                    while start_timestep < self.prediction_steps:
                         dgl_graph = self.init_dgl_graph(dd['batch_idxs'], ctrs, dd['orig'], dd['rot'], dd["agenttypes"], world_locs, has_preds).to(dev)
                         # only process observed features
                         dgl_graph = self.feature_encoder(dgl_graph, feats, dd['agenttypes'], dd['actor_idcs'], actor_ctrs, dd['lane_graph'])
@@ -382,7 +383,8 @@ class FJMP(torch.nn.Module):
                         # produces dictionary of results
                         res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=prop_ground_truth, eval=False)
                         
-                        steps_before_replan = random.randint(1, config['prediction_steps']) #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
+                        steps_before_replan = random.randint(1, self.prediction_steps) #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
+                        #print(hvd.rank(), steps_before_replan)
                         loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], has_preds, gt_locs, gt_psirads, gt_vels, dd['batch_size'], dd["ig_labels"], epoch, steps = steps_before_replan)
                         
                         sum_timesteps_across_rollouts += (self.prediction_steps - start_timestep) # this term deals with the fact that some runs will attend over the same timestep multiple times. the sum of timesteps predicted is saved.
@@ -394,9 +396,9 @@ class FJMP(torch.nn.Module):
                         #here, we need to take the information to generate the starting position for the next step of the rollout
                         old_start_timestep = start_timestep
                         start_timestep += steps_before_replan
-                        if start_timestep > config['prediction_steps']:
-                            start_timestep = config['prediction_steps']
-                            steps_before_replan = config['prediction_steps'] - old_start_timestep
+                        if start_timestep > self.prediction_steps:
+                            start_timestep = self.prediction_steps
+                            steps_before_replan = self.prediction_steps - old_start_timestep
 
                         padding = (0, 0, 0, steps_before_replan)
                         pred_padding = (0, steps_before_replan)
@@ -417,11 +419,11 @@ class FJMP(torch.nn.Module):
 
                         
                         # rotate things back into the SE-2 reference frame
-                        res['loc_pred'] = torch.matmul(res['loc_pred'].cpu() - dd['orig'].view(-1, 1, 1, 2), torch.linalg.inv(dd['rot'].unsqueeze(1)))
-                        res['head_pred'] = torch.matmul(res['head_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
-                        res['vel_pred'] = torch.matmul(res['vel_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        loc_pred_se2 = torch.matmul(res['loc_pred'].cpu() - dd['orig'].view(-1, 1, 1, 2), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        head_pred_se2 = torch.matmul(res['head_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        vel_pred_se2 = torch.matmul(res['vel_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
                         # convert heading back into a rad
-                        res['head_pred'] = torch.atan2(res['head_pred'][:, :, :, 1], res['head_pred'][:, :, :, 0]).unsqueeze(3) #first is y second is x
+                        head_pred_se2 = torch.atan2(head_pred_se2[:, :, :, 1], head_pred_se2[:, :, :, 0]).unsqueeze(3) #first is y second is x
  
                         
 
@@ -429,16 +431,17 @@ class FJMP(torch.nn.Module):
                         repeated_argmins = argmin.repeat_interleave(dgl_graph.batch_num_nodes())
                         
                         # Generate the indices for advanced indexing
-                        vehicle_indices = torch.arange(res['loc_pred'].size(0)).unsqueeze(1)
-                        time_indices = torch.arange(res['loc_pred'].size(1)).unsqueeze(0)
+                        vehicle_indices = torch.arange(loc_pred_se2.size(0)).unsqueeze(1)
+                        time_indices = torch.arange(loc_pred_se2.size(1)).unsqueeze(0)
                         mode_indices = repeated_argmins.unsqueeze(1) # selects the best mode up to time of replanning.
 
                         # Use advanced indexing to select the desired elements
-                        best_loc = res['loc_pred'][vehicle_indices, time_indices, mode_indices]
-                        best_head = res['head_pred'][vehicle_indices, time_indices, mode_indices]
-                        best_vel = res['vel_pred'][vehicle_indices, time_indices, mode_indices]
+                        best_loc_se2 = loc_pred_se2[vehicle_indices, time_indices, mode_indices]
+                        best_head_se2 = head_pred_se2[vehicle_indices, time_indices, mode_indices]
+                        best_vel_se2 = vel_pred_se2[vehicle_indices, time_indices, mode_indices]
 
-                        ctrs = best_loc[:, steps_before_replan-1] #these lines grabs the best ctrs with the appropriate timeshift
+                        old_ctrs = ctrs
+                        ctrs = best_loc_se2[:, steps_before_replan-1] #these lines grabs the best ctrs with the appropriate timeshift
 
                         #world locs are just used for teacher forcing
                         world_locs = world_locs[:, steps_before_replan:]#same trick as up above with gt_preds
@@ -446,10 +449,15 @@ class FJMP(torch.nn.Module):
 
                         j = 0
                         for s, num_in_scene in enumerate(dgl_graph.batch_num_nodes()):
-                            actor_ctrs[s] = best_loc[j:j+num_in_scene, steps_before_replan-1].to(dev)
+                            actor_ctrs[s] = best_loc_se2[j:j+num_in_scene, steps_before_replan-1].to(dev)
                             j+=num_in_scene
 
-                        new_feats = torch.cat([best_loc, best_vel, best_head], dim=2)
+                        #feats are made up of offsets + vels + psirads (heading angle)
+                        #here, we calculate the offsets
+                        diff = best_loc_se2[:, 1:, :] - best_loc_se2[:, :-1, :] 
+                        first_offset = best_loc_se2[:, 0, :] - old_ctrs
+                        diff = torch.cat((first_offset.unsqueeze(1), diff), 1)
+                        new_feats = torch.cat([diff, best_vel_se2, best_head_se2], dim=2)
 
                         feats = feats[:, :self.observation_steps]
                         a = feats[:, steps_before_replan:]
@@ -459,12 +467,13 @@ class FJMP(torch.nn.Module):
                         feats = torch.cat([a.to(dev), b.to(dev)], dim = 1)
                         feats = feats[:, :self.observation_steps]
 
+                        best_loc = res['loc_pred'][vehicle_indices, time_indices, mode_indices]
                         collective_res.append(best_loc[:, :steps_before_replan])
                         inner_loops += 1
                     outer_loops += 1    
                     
 
-                    norm_term = sum_timesteps_across_rollouts / self.prediction_steps# play with this. it might be helping or hurting.
+                    norm_term = self.prediction_steps / sum_timesteps_across_rollouts# play with this. it might be helping or hurting.
                     loss = loss * norm_term
                 else:
                     dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
@@ -644,7 +653,8 @@ class FJMP(torch.nn.Module):
 
         tot = 0
         with torch.no_grad():
-            tot_log = self.num_val_samples // (self.batch_size * hvd.size())            
+            tot_log = self.num_val_samples // (self.batch_size * hvd.size())
+            random.seed(0)
             for i, data in enumerate(val_loader):
                 dd = self.process(data)
 
@@ -719,11 +729,11 @@ class FJMP(torch.nn.Module):
 
                         
                         # rotate things back into the SE-2 reference frame
-                        res['loc_pred'] = torch.matmul(res['loc_pred'].cpu() - dd['orig'].view(-1, 1, 1, 2), torch.linalg.inv(dd['rot'].unsqueeze(1)))
-                        res['head_pred'] = torch.matmul(res['head_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
-                        res['vel_pred'] = torch.matmul(res['vel_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        loc_pred_se2 = torch.matmul(res['loc_pred'].cpu() - dd['orig'].view(-1, 1, 1, 2), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        head_pred_se2 = torch.matmul(res['head_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
+                        vel_pred_se2 = torch.matmul(res['vel_pred'].cpu(), torch.linalg.inv(dd['rot'].unsqueeze(1)))
                         # convert heading back into a rad
-                        res['head_pred'] = torch.atan2(res['head_pred'][:, :, :, 1], res['head_pred'][:, :, :, 0]).unsqueeze(3) #first is y second is x
+                        head_pred_se2 = torch.atan2(head_pred_se2[:, :, :, 1], head_pred_se2[:, :, :, 0]).unsqueeze(3) #first is y second is x
  
                         
 
@@ -731,16 +741,18 @@ class FJMP(torch.nn.Module):
                         repeated_argmins = argmin.repeat_interleave(dgl_graph.batch_num_nodes())
                         
                         # Generate the indices for advanced indexing
-                        vehicle_indices = torch.arange(res['loc_pred'].size(0)).unsqueeze(1)
-                        time_indices = torch.arange(res['loc_pred'].size(1)).unsqueeze(0)
+                        vehicle_indices = torch.arange(loc_pred_se2.size(0)).unsqueeze(1)
+                        time_indices = torch.arange(loc_pred_se2.size(1)).unsqueeze(0)
                         mode_indices = repeated_argmins.unsqueeze(1) # selects the best mode up to time of replanning.
 
                         # Use advanced indexing to select the desired elements
-                        best_loc = res['loc_pred'][vehicle_indices, time_indices, mode_indices]
-                        best_head = res['head_pred'][vehicle_indices, time_indices, mode_indices]
-                        best_vel = res['vel_pred'][vehicle_indices, time_indices, mode_indices]
+                        best_loc_se2 = loc_pred_se2[vehicle_indices, time_indices, mode_indices]
+                        best_head_se2 = head_pred_se2[vehicle_indices, time_indices, mode_indices]
+                        best_vel_se2 = vel_pred_se2[vehicle_indices, time_indices, mode_indices]
 
-                        ctrs = best_loc[:, steps_before_replan-1] #these lines grabs the best ctrs with the appropriate timeshift
+
+                        old_ctrs = ctrs
+                        ctrs = best_loc_se2[:, steps_before_replan-1] #these lines grabs the best ctrs with the appropriate timeshift
 
                         #world locs are just used for teacher forcing
                         world_locs = world_locs[:, steps_before_replan:]#same trick as up above with gt_preds
@@ -748,10 +760,16 @@ class FJMP(torch.nn.Module):
 
                         j = 0
                         for s, num_in_scene in enumerate(dgl_graph.batch_num_nodes()):
-                            actor_ctrs[s] = best_loc[j:j+num_in_scene, steps_before_replan-1].to(dev)
+                            actor_ctrs[s] = best_loc_se2[j:j+num_in_scene, steps_before_replan-1].to(dev)
                             j+=num_in_scene
 
-                        new_feats = torch.cat([best_loc, best_vel, best_head], dim=2)
+                        #feats are made up of offsets + vels + psirads (heading angle)
+                        #here, we calculate the offsets
+                        diff = best_loc_se2[:, 1:, :] - best_loc_se2[:, :-1, :] 
+                        first_offset = best_loc_se2[:, 0, :] - old_ctrs
+                        diff = torch.cat((first_offset.unsqueeze(1), diff), 1)
+                        new_feats = torch.cat([diff, best_vel_se2, best_head_se2], dim=2)
+
 
                         feats = feats[:, :self.observation_steps]
                         a = feats[:, steps_before_replan:]
@@ -760,10 +778,11 @@ class FJMP(torch.nn.Module):
                         b = new_feats[:, q:]
                         feats = torch.cat([a.to(dev), b.to(dev)], dim = 1)
                         feats = feats[:, :self.observation_steps]
-                        
+
+                        best_loc = res['loc_pred'][vehicle_indices, time_indices, mode_indices]
                         collective_res.append(best_loc[:, :steps_before_replan])
 
-                    norm_term = sum_timesteps_across_rollouts / self.prediction_steps# play with this. it might be helping or hurting.
+                    norm_term = self.prediction_steps / sum_timesteps_across_rollouts# play with this. it might be helping or hurting.
                     loss = loss * norm_term
                 else:
                     dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd['agenttypes'], dd['world_locs'], dd['has_preds']).to(dev)
