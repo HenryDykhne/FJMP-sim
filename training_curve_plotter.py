@@ -3,7 +3,7 @@ import os
 import matplotlib.pyplot as plt
 
 # Define an array of file names
-file_names = ['logs/fjmp_with_new_heads/log_initial_training_schedule','logs/fjmp_with_new_heads/log_new_training_schedule']
+file_names = ['logs/fjmp_with_new_heads/log_initial_training_schedule','logs/fjmp_with_new_heads/log_new_training_schedule', 'logs/fjmp_with_new_heads/log']
 
 # Define a list of colors to use for each file
 colors = ['black', 'red', 'orange', 'green', 'blue', 'purple']

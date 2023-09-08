@@ -301,8 +301,9 @@ class FJMP(torch.nn.Module):
         hvd.broadcast_parameters(self.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
         
+        inner_loops = 0
+        outer_loops = 0
         for epoch in range(start_epoch, self.max_epochs + 1):   
-            random.seed(0)
             # this shuffles the training set every epoch         
             train_loader.sampler.set_epoch(int(epoch))
             
@@ -339,9 +340,7 @@ class FJMP(torch.nn.Module):
             
             tot = 0
             accum_gradients = {}
-
-            inner_loops = 0
-            outer_loops = 0
+            torch.manual_seed(0)
             for i, data in enumerate(train_loader):      
                 #random.seed(hvd.rank() * 100 + i * 10)
                 # get data dictionary for processing batch
@@ -383,7 +382,7 @@ class FJMP(torch.nn.Module):
                         # produces dictionary of results
                         res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=prop_ground_truth, eval=False)
                         
-                        steps_before_replan = random.randint(1, self.prediction_steps) #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
+                        #steps_before_replan = torch.randint(1, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
                         #print(hvd.rank(), steps_before_replan)
                         loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], has_preds, gt_locs, gt_psirads, gt_vels, dd['batch_size'], dd["ig_labels"], epoch, steps = steps_before_replan)
                         
@@ -654,7 +653,7 @@ class FJMP(torch.nn.Module):
         tot = 0
         with torch.no_grad():
             tot_log = self.num_val_samples // (self.batch_size * hvd.size())
-            random.seed(0)
+            torch.manual_seed(0)
             for i, data in enumerate(val_loader):
                 dd = self.process(data)
 
@@ -694,7 +693,7 @@ class FJMP(torch.nn.Module):
                         # produces dictionary of results
                         res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=0., eval=True)
                         
-                        steps_before_replan = random.randint(1, config['prediction_steps']) #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
+                        steps_before_replan = torch.randint(1, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
                         loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], has_preds, gt_locs, gt_psirads, gt_vels, dd['batch_size'], dd["ig_labels"], epoch, steps = steps_before_replan)
                         
                         sum_timesteps_across_rollouts += (self.prediction_steps - start_timestep) # this term deals with the fact that some runs will attend over the same timestep multiple times. the sum of timesteps predicted is saved.
