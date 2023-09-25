@@ -1,4 +1,6 @@
 /dataset_INTERACTION/*
+/dataset_AV2/*
 /logs/*
 *.pyc
 /misc/log
+*.npy

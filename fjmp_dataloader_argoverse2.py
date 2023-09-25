@@ -22,6 +22,9 @@ from av2.map.map_api import ArgoverseStaticMap
 from av2.geometry.interpolate import compute_midpoint_line
 from scipy import sparse
 
+PAST_LENGTH = 30
+FUTURE_LENGTH = 80
+
 class Argoverse2Dataset(Dataset):
     def __init__(self, config, train=True, train_all=False):
         self.config = config 
@@ -198,7 +201,7 @@ class Argoverse2Dataset(Dataset):
             while True:
                 # Are the observed timesteps available for this agent?
                 found = True
-                for i in range(50):
+                for i in range(PAST_LENGTH):
                     if i not in data['steps'][orig_idx]:
                         found = False
                         break
@@ -214,13 +217,13 @@ class Argoverse2Dataset(Dataset):
                     break
             
             assert found_AV
-            assert len(data['track_ids'][i]) == 110
+            assert len(data['track_ids'][i]) == (PAST_LENGTH + FUTURE_LENGTH)
 
             orig_idx = i
             del data['track_ids']
         
-        orig = data['trajs'][orig_idx][49].copy().astype(np.float32)
-        pre = data['trajs'][orig_idx][48] - orig 
+        orig = data['trajs'][orig_idx][(PAST_LENGTH - 1)].copy().astype(np.float32)
+        pre = data['trajs'][orig_idx][(PAST_LENGTH - 2)] - orig 
         # Since theta is pi - arctan(.), then the range of theta is
         # max: pi - (-pi) = 2pi
         # min: pi - (pi) = 0
@@ -236,7 +239,7 @@ class Argoverse2Dataset(Dataset):
         is_valid_agent = []
 
         for traj, step, vel, psirad, agenttype, agentcategory in zip(data['trajs'], data['steps'], data['vels'], data['psirads'], data['agenttypes'], data['agentcategories']):
-            if 49 not in step:
+            if (PAST_LENGTH - 1) not in step:
                 is_valid_agent.append(0)
                 continue
 
@@ -253,18 +256,18 @@ class Argoverse2Dataset(Dataset):
             is_valid_agent.append(1)
 
             # ground-truth future positions
-            gt_pred = np.zeros((60, 2), np.float32)
+            gt_pred = np.zeros((FUTURE_LENGTH, 2), np.float32)
             # ground truth future velocities
-            gt_vel = np.zeros((60, 2), np.float32)
+            gt_vel = np.zeros((FUTURE_LENGTH, 2), np.float32)
             # ground truth yaw angles
-            gt_psirad = np.zeros((60, 1), np.float32)
+            gt_psirad = np.zeros((FUTURE_LENGTH, 1), np.float32)
 
             # has ground-truth future mask
-            has_pred = np.zeros(60, bool)
-            has_obs = np.zeros(110, bool)
+            has_pred = np.zeros(FUTURE_LENGTH, bool)
+            has_obs = np.zeros((PAST_LENGTH + FUTURE_LENGTH), bool)
 
-            future_mask = np.logical_and(step >= 50, step < 110)
-            post_step = step[future_mask] - 50
+            future_mask = np.logical_and(step >= PAST_LENGTH, step < (PAST_LENGTH + FUTURE_LENGTH))
+            post_step = step[future_mask] - PAST_LENGTH
             post_traj = traj[future_mask]
             post_vel = vel[future_mask]
             post_agenttype = agenttype[future_mask]
@@ -285,13 +288,13 @@ class Argoverse2Dataset(Dataset):
             has_obs[step] = 1
 
             # only observation horizon
-            obs_step = step[step < 50]
+            obs_step = step[step < PAST_LENGTH]
             obs_idcs = obs_step.argsort()
             obs_step = obs_step[obs_idcs]
 
             # take contiguous past to be the past
             for i in range(len(obs_step)):
-                if obs_step[i] == 50 - len(obs_step) + i:
+                if obs_step[i] == PAST_LENGTH - len(obs_step) + i:
                     break
             step = step[i:]
             traj = traj[i:]
@@ -300,11 +303,11 @@ class Argoverse2Dataset(Dataset):
             psirad = psirad[i:]
             agentcategory = agentcategory[i:]
 
-            feat = np.zeros((110, 2), np.float32)
-            feat_vel = np.zeros((110, 2), np.float32)
-            feat_agenttype = np.zeros((110, 1), np.float32)
-            feat_psirad = np.zeros((110, 1), np.float32)
-            feat_agentcategory = np.zeros((110, 2), np.float32)
+            feat = np.zeros(((PAST_LENGTH + FUTURE_LENGTH), 2), np.float32)
+            feat_vel = np.zeros(((PAST_LENGTH + FUTURE_LENGTH), 2), np.float32)
+            feat_agenttype = np.zeros(((PAST_LENGTH + FUTURE_LENGTH), 1), np.float32)
+            feat_psirad = np.zeros(((PAST_LENGTH + FUTURE_LENGTH), 1), np.float32)
+            feat_agentcategory = np.zeros(((PAST_LENGTH + FUTURE_LENGTH), 2), np.float32)
 
             # center and rotate positions, rotate velocities
             feat[step] = np.matmul(rot, (traj - orig.reshape(-1, 2)).T).T
@@ -326,7 +329,7 @@ class Argoverse2Dataset(Dataset):
             feat_agenttype[step] = agenttype
 
             # ctrs contains the centers at the present timestep
-            ctrs.append(feat[49, :].copy())
+            ctrs.append(feat[(PAST_LENGTH - 1), :].copy())
 
             feat_loc = np.copy(feat)
             # feat contains trajectory offsets
@@ -362,7 +365,7 @@ class Argoverse2Dataset(Dataset):
         ig_labels_sparse = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, 25)
         ig_labels_sparse = np.asarray(ig_labels_sparse, np.float32)
 
-        ig_labels_dense = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, 60)
+        ig_labels_dense = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, FUTURE_LENGTH)
         ig_labels_dense = np.asarray(ig_labels_dense, np.float32)
 
         ig_labels_m2i = self.get_interaction_labels_m2i(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes)
@@ -411,12 +414,12 @@ class Argoverse2Dataset(Dataset):
 
     def get_interaction_labels_fjmp(self, idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, eps_I):
 
-        feat_locs = feat_locs[:, 50:]
-        feat_vels = feat_vels[:, 50:]
-        feat_psirads = feat_psirads[:, 50:]
+        feat_locs = feat_locs[:, PAST_LENGTH:]
+        feat_vels = feat_vels[:, PAST_LENGTH:]
+        feat_psirads = feat_psirads[:, PAST_LENGTH:]
         
         # only consider the future
-        has_obss = has_obss[:, 50:]
+        has_obss = has_obss[:, PAST_LENGTH:]
         
         N = feat_locs.shape[0]
         labels = np.zeros((N, N))
@@ -424,17 +427,17 @@ class Argoverse2Dataset(Dataset):
 
         circle_lists = []
         for i in range(N):
-            length_i = self.avg_agent_length[feat_agenttypes[i, 49, 0]]
-            width_i = self.avg_agent_width[feat_agenttypes[i, 49, 0]]
+            length_i = self.avg_agent_length[feat_agenttypes[i, (PAST_LENGTH - 1), 0]]
+            width_i = self.avg_agent_width[feat_agenttypes[i, (PAST_LENGTH - 1), 0]]
             traj_i = orig_trajs[i][has_obss[i] == 1]
             psirad_i = feat_psirads[i][has_obss[i] == 1]
-            # shape is [60, c, 2], where c is the number of circles prescribed to vehicle i (depends on the size/shape of vehicle i)
+            # shape is [FUTURE_LENGTH, c, 2], where c is the number of circles prescribed to vehicle i (depends on the size/shape of vehicle i)
             circle_lists.append(return_circle_list(traj_i[:, 0], traj_i[:, 1], length_i, width_i, psirad_i[:, 0]))
         
         for a in range(1, N):
             for b in range(a):
-                width_a = self.avg_agent_width[feat_agenttypes[a, 49, 0]]
-                width_b = self.avg_agent_width[feat_agenttypes[b, 49, 0]]
+                width_a = self.avg_agent_width[feat_agenttypes[a, (PAST_LENGTH - 1), 0]]
+                width_b = self.avg_agent_width[feat_agenttypes[b, (PAST_LENGTH - 1), 0]]
                 # for each (unordered) pairs of vehicles, we check if they are interacting
                 # by checking if there is a collision at any pair of future timesteps. 
                 circle_list_a = circle_lists[a]
@@ -465,11 +468,11 @@ class Argoverse2Dataset(Dataset):
                     if ind == 0:
                         is_coll_mask = np.insert(is_coll_mask, en, 0, axis=1)  
 
-                assert is_coll_mask.shape == (60, 60)
+                assert is_coll_mask.shape == (FUTURE_LENGTH, FUTURE_LENGTH)
 
                 # [P, 2], first index is a, second is b; P is number of colliding pairs
                 coll_ids = np.argwhere(is_coll_mask == 1)
-                # only preserve the colliding pairs that are within eps_I (e.g. 6 seconds (= 60 timesteps)) of eachother
+                # only preserve the colliding pairs that are within eps_I (e.g. 6 seconds (= FUTURE_LENGTH timesteps)) of eachother
                 valid_coll_mask = np.abs(coll_ids[:, 0] - coll_ids[:, 1]) <= eps_I
 
                 if valid_coll_mask.sum() < 1:
@@ -576,11 +579,11 @@ class Argoverse2Dataset(Dataset):
         for a in range(1, N):
             for b in range(a):
                 # sum of the length of these two vehicles.               
-                len_a = self.avg_agent_length[feat_agenttypes[a, 49, 0]]
+                len_a = self.avg_agent_length[feat_agenttypes[a, (PAST_LENGTH - 1), 0]]
                 if np.isnan(len_a):
                     print("This should not happen")
                     len_a = 1
-                len_b =  self.avg_agent_length[feat_agenttypes[b, 49, 0]]
+                len_b =  self.avg_agent_length[feat_agenttypes[b, (PAST_LENGTH - 1), 0]]
                 if np.isnan(len_b):
                     print("This should not happen")
                     len_b = 1
@@ -606,13 +609,13 @@ class Argoverse2Dataset(Dataset):
                     if ind == 0:
                         dist_ab = np.insert(dist_ab, en, 10000, axis=1)   
 
-                # broadcast back into a length 110 tensor first.
-                assert dist_ab.shape == (110, 110) 
+                # broadcast back into a length (PAST_LENGTH + FUTURE_LENGTH) tensor first.
+                assert dist_ab.shape == ((PAST_LENGTH + FUTURE_LENGTH), (PAST_LENGTH + FUTURE_LENGTH)) 
 
                 # We only consider the future positions, as the past positions are already fed into the model.
-                dist_ab = dist_ab[50:, 50:]            
+                dist_ab = dist_ab[PAST_LENGTH:, PAST_LENGTH:]            
 
-                # in [0, 59] (future timestep)
+                # in [0, (FUTURE_LENGTH - 1)] (future timestep)
                 min_a, min_b = np.unravel_index(dist_ab.argmin(), dist_ab.shape)
                 
                 if np.min(dist_ab) > EPSILON_D:
@@ -624,9 +627,9 @@ class Argoverse2Dataset(Dataset):
                     labels[b, a] = 1
                 else:                    
                     # if both reach the conflict point at the same timestep, the influencer is the vehicle with the higher velocity @ the conflict point.
-                    if np.linalg.norm(feat_vels[a][min_a + 50], ord=2) > np.linalg.norm(feat_vels[b][min_b + 50], ord=2):
+                    if np.linalg.norm(feat_vels[a][min_a + PAST_LENGTH], ord=2) > np.linalg.norm(feat_vels[b][min_b + PAST_LENGTH], ord=2):
                         labels[a, b] = 1
-                    elif np.linalg.norm(feat_vels[a][min_a + 50], ord=2) < np.linalg.norm(feat_vels[b][min_b + 50], ord=2):
+                    elif np.linalg.norm(feat_vels[a][min_a + PAST_LENGTH], ord=2) < np.linalg.norm(feat_vels[b][min_b + PAST_LENGTH], ord=2):
                         labels[b, a] = 1
                     else:
                         labels[a, b] = 0
@@ -640,7 +643,7 @@ class Argoverse2Dataset(Dataset):
         # labels for interaction visualization
         valid_mask = is_valid_agent
 
-        # add indices for the invalid agents (no gt position at timestep 49)
+        # add indices for the invalid agents (no gt position at timestep (PAST_LENGTH - 1))
         for ind in range(valid_mask.shape[0]):
             if valid_mask[ind] == 0:
                 labels = np.insert(labels, ind, 0, axis=1)

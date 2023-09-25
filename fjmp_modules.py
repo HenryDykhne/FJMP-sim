@@ -3,6 +3,7 @@ import dgl
 import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Normal
+from torch_scatter import scatter
 import dgl.function as fn
 import torch
 from fractions import gcd
@@ -126,7 +127,7 @@ class FJMPFeatureEncoder(nn.Module):
 
         if not self.config["no_agenttype_encoder"]:
             self.agenttype_enc = Linear(self.config["num_agenttypes"], self.h_dim_gru)
-        self.feat_enc = nn.GRU(self.config['input_size'], self.h_dim_gru, 1)
+        self.feat_enc = nn.GRU(self.config['input_size'] + 2, self.h_dim_gru, 1)#+2 so we can add the length and width to each step
         self.map_net = MapNet(self.config)
         self.l2a = L2A(self.config)
         self.a2a = A2A(self.config)
@@ -146,6 +147,11 @@ class FJMPFeatureEncoder(nn.Module):
                         param.data.fill_(0)
 
     def forward(self, graph, x, agenttypes, actor_idcs, actor_ctrs, lane_graph):
+        N, T ,_ = x.size()
+        
+        expanded_shape = graph.ndata["shape"].unsqueeze(1).expand(N, T, 2).to(x.device)
+
+        x = torch.cat([x, expanded_shape], dim=2)
         # [N, T, 5] --> [T, N, 5]
         x = x.transpose(1, 0).to(graph.ndata["ctrs"].device)
         h0 = torch.zeros(1, x.shape[1], self.h_dim_gru).to(x.device)
@@ -262,6 +268,80 @@ class FJMPTrajectoryProposalDecoder(nn.Module):
         proposals = proposals.transpose(1, 2)
         
         return graph, proposals
+    
+# confidence method 3, dedicated module for predicting confidences
+class FJMPConfidenceHeader(nn.Module):
+    def __init__(self, config):
+        super(FJMPConfidenceHeader, self).__init__()
+        self.config = config
+
+        self.encode_dest = LinearRes(2 * config["prediction_steps"], self.config['h_dim'])
+        self.encode_futures = MLP1(2 * self.config["h_dim"], self.config["h_dim"])
+        
+        self.f_e = MLP1(self.config['h_dim'] * 2 + self.config["prediction_steps"] * 2, self.config['h_dim'])
+        self.f_agg = nn.GRUCell(self.config["h_dim"], self.config["h_dim"])
+        self.f_o = Linear1(self.config['h_dim'], self.config['h_dim'])
+
+        self.f_confidence = nn.Linear(self.config['h_dim'] * self.config["num_joint_modes"], self.config["num_joint_modes"])
+
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight.data)
+                if m.bias is not None: nn.init.constant_(m.bias, 0.1)
+
+    def message_func(self, edges):
+        futures_rel = edges.src['pred_loc'] - edges.dst['ctrs'].reshape(-1, 1, 1, 2)
+        futures_rel = futures_rel.transpose(1,2).reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"] * 2)
+
+        h_e = self.f_e(torch.cat([edges.src['h_n'], edges.dst['h_n'], futures_rel], dim=-1))
+        return {'h_e': h_e}
+
+    def reduce_func(self, nodes):       
+        # max pooling
+        res, _ = torch.max(nodes.mailbox['h_e'], dim=1)
+        res = res.reshape(-1, self.config["h_dim"])
+        h_n = self.f_agg(res, nodes.data['h_n'].reshape(-1, self.config["h_dim"]))
+
+        h_n = self.f_o(h_n.reshape(-1, self.config["num_joint_modes"], self.config["h_dim"]))
+
+        return {'h_n': h_n}
+    
+    def node_to_edge_to_node(self, graph):
+        graph.update_all(self.message_func, self.reduce_func)
+
+        return graph
+    
+    def forward(self, graph, batch_idxs):
+        # initialize features of DGL graph
+        dests = graph.ndata["pred_loc"] - graph.ndata["ctrs"].reshape(-1, 1, 1, 2)
+        dests = dests.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"] * 2)        
+        dest_feats = []
+        for i in range(self.config["num_joint_modes"]):
+            dest_feats.append(self.encode_dest(dests[:, i, :]))
+        dest_feats = torch.cat([x.unsqueeze(1) for x in dest_feats], 1)
+        
+        h_n = self.encode_futures(torch.cat([graph.ndata["v_n"], dest_feats], dim=-1))
+        graph.ndata["h_n"] = h_n
+        
+        # perform message passing
+        graph = self.node_to_edge_to_node(graph)
+
+        # pop the final hidden features
+        h_n = graph.ndata.pop("h_n")
+
+        # final processing
+        h_n = h_n.reshape(-1, self.config["num_joint_modes"] * self.config["h_dim"])
+
+        # max pool over agent dimension
+        h_n = scatter(h_n, batch_idxs.long().to(h_n.device), dim=0, reduce='max')
+        
+        confidences = self.f_confidence(h_n)
+        confidences = F.log_softmax(confidences, dim=-1)
+
+        return confidences
 
 
 # This is the DAGNN decoder
@@ -273,6 +353,9 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
         fc1s = []
         fc2s = []
         fc3s = []
+
+        #confidence
+        self.confidence_scorer = FJMPConfidenceHeader(self.config)
         
         for i in range(self.config["num_heads"]):
             fc1s.append(nn.Linear(self.config["h_dim"], self.config["h_dim"], bias=False))
@@ -419,7 +502,7 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
 
         return graph
 
-    def forward(self, graph, prop_ground_truth=0., batch_idcs=None):
+    def forward(self, graph, confidence_graph, prop_ground_truth=0., batch_idcs=None):
         
         graph.ndata["xt_dec"] = graph.ndata["xt_enc"]
         # [N, h_dim]
@@ -447,9 +530,9 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
                                 message_func=self.message_func,
                                 reduce_func=self.reduce_func)
 
-            f_decode = graph.ndata.pop("f_decode")
-            h_decode = graph.ndata.pop("h_decode")
-            v_decode = graph.ndata.pop("v_decode")
+            f_decode = graph.ndata["f_decode"]
+            h_decode = graph.ndata["h_decode"]
+            v_decode = graph.ndata["v_decode"]
 
             pred_loc = torch.matmul(f_decode, graph.ndata["rot"].unsqueeze(1)) + graph.ndata["orig"].view(-1, 1, 1, 2)
             pred_head = torch.matmul(h_decode, graph.ndata["rot"].unsqueeze(1)) 
@@ -461,7 +544,7 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
         
         # special case when we have an empty dgl graph
         else:
-            v_n = graph.ndata.pop("v_n") 
+            v_n = graph.ndata["v_n"] 
             mode_idx = torch.zeros(v_n.shape[0], self.config["num_joint_modes"], self.config["num_joint_modes"]).to(v_n.device)
             for mode in range(self.config["num_joint_modes"]):
                 mode_idx[:, mode, mode] = 1.
@@ -476,13 +559,18 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
                 v_preds.append(self.v_out(out[:, i, :]))    
             
             dests = torch.cat([x.unsqueeze(1) for x in preds], 1)
+
             heads = torch.cat([x.unsqueeze(1) for x in h_preds], 1)
             vels = torch.cat([x.unsqueeze(1) for x in v_preds], 1)
 
             f_decode = dests.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2) + graph.ndata["ctrs"].view(-1, 1, 1, 2)      
             h_decode = heads.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2)
             v_decode = vels.reshape(-1, self.config["num_joint_modes"], self.config["prediction_steps"], 2)
-            
+
+            graph.ndata["f_decode"] = f_decode
+            graph.ndata["h_decode"] = h_decode
+            graph.ndata["v_decode"] = v_decode
+
             pred_loc = torch.matmul(f_decode, graph.ndata["rot"].unsqueeze(1)) + graph.ndata["orig"].view(-1, 1, 1, 2)
             pred_head = torch.matmul(h_decode, graph.ndata["rot"].unsqueeze(1)) 
             pred_vel = torch.matmul(v_decode, graph.ndata["rot"].unsqueeze(1)) 
@@ -490,10 +578,20 @@ class FJMPAttentionTrajectoryDecoder(nn.Module):
             pred_loc = pred_loc.transpose(1, 2)
             pred_head = pred_head.transpose(1, 2)
             pred_vel = pred_vel.transpose(1, 2)
+
+        confidence_graph.ndata["v_n"] = graph.ndata["v_n"].detach()
+        confidence_graph.ndata["pred_loc"] = pred_loc.detach()
+        mode_conf = self.confidence_scorer(confidence_graph, batch_idcs)
         
         # [N, prediction_steps, num_joint_modes, 2]
-        return pred_loc, pred_head, pred_vel
-
+        return pred_loc, pred_head, pred_vel, mode_conf
+    
+# class ModeConfidencePredictorHead(nn.Module):#delete this at the same time as line 140 in fjmp
+#     def __init__(self, config):
+#         super(ModeConfidencePredictorHead, self).__init__()
+#         self.combine = MLP(1128, config['h_dim'])
+#         self.conf_pred = MLP(config['h_dim'], 6)
+    
 class LaneGCNHeader(nn.Module):
     def __init__(self, config):
         super(LaneGCNHeader, self).__init__()

@@ -110,8 +110,8 @@ RUN APT_INSTALL="apt-get install -y --no-install-recommends" && \
         enum34==1.1.10 \
         pyyaml==6.0 \
         tqdm==4.64.1 \
-#        alphashape==1.3.1 \ For whatever reason, these two lines cause errors
-#        lanelet2==1.2.1 \
+        alphashape==1.3.1 \ 
+        lanelet2==1.2.1 \
 
 
         numpy==1.23.5 \

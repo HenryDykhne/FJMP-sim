@@ -54,6 +54,7 @@ parser.add_argument("--eval_training", action="store_true", help="run evaluation
 parser.add_argument("--supervise_vehicles", action="store_true", help="supervise only vehicles in loss function (for INTERACTION)?")
 parser.add_argument("--train_all", action="store_true", help="train on both the train and validation sets?")
 parser.add_argument("--no_agenttype_encoder", action="store_true", help="encode agent type in FJMP encoder? Only done for Argoverse 2 as INTERACTION only predicts vehicle trajectories.")
+parser.add_argument("--include_collision_loss", action="store_true", help="wether or not to include the collision loss")
 
 args = parser.parse_args()
 
@@ -82,6 +83,7 @@ class FJMP(torch.nn.Module):
         self.num_agenttypes = config["num_agenttypes"]
         self.switch_lr_1 = config["switch_lr_1"]
         self.switch_lr_2 = config["switch_lr_2"]
+        self.activate_collision_loss = config["activate_collision_loss"] if "activate_collision_loss" in config else None
         self.lr_step = config["lr_step"]
         self.mode = config["mode"]
         self.input_size = config["input_size"]
@@ -115,7 +117,9 @@ class FJMP(torch.nn.Module):
         self.eval_training = config["eval_training"]
         self.supervise_vehicles = config["supervise_vehicles"]
         self.no_agenttype_encoder = config["no_agenttype_encoder"]
+        self.include_collision_loss = config["include_collision_loss"] if ("include_collision_loss" in config) else False #just cause im using a first stage that was trained before this was a feature, so the old config was loaded. #REMOVE AFTER RETRAINING STAGE 1
         self.train_all = config["train_all"]
+        self.conf_switch = config['conf_switch'] if ("conf_switch" in config) else False #just cause im using a first stage that was trained before this was a feature, so the old config was loaded. #REMOVE AFTER RETRAINING STAGE 1
         
         if self.two_stage_training and self.training_stage == 2:
             self.pretrained_relation_header = None
@@ -133,6 +137,7 @@ class FJMP(torch.nn.Module):
         if (self.two_stage_training and self.training_stage == 2) or not self.two_stage_training:
             if self.decoder == 'dagnn':
                 self.trajectory_decoder = FJMPAttentionTrajectoryDecoder(self.config).to(dev)
+                #self.mode_confidence_predictor = ModeConfidencePredictorHead(self.config).to(dev)#delete this with the class in fjmp_modules at the same time
             elif self.decoder == 'lanegcn':
                 self.trajectory_decoder = LaneGCNHeader(self.config).to(dev)
 
@@ -303,7 +308,8 @@ class FJMP(torch.nn.Module):
         
         inner_loops = 0
         outer_loops = 0
-        for epoch in range(start_epoch, self.max_epochs + 1):   
+        for epoch in range(start_epoch, self.max_epochs + 1):
+            #print(epoch)
             # this shuffles the training set every epoch         
             train_loader.sampler.set_epoch(int(epoch))
             
@@ -341,6 +347,8 @@ class FJMP(torch.nn.Module):
             tot = 0
             accum_gradients = {}
             torch.manual_seed(0)
+            correct_conf_sum = 0
+            total_conf_predictions = 0
             for i, data in enumerate(train_loader):      
                 #random.seed(hvd.rank() * 100 + i * 10)
                 # get data dictionary for processing batch
@@ -350,11 +358,15 @@ class FJMP(torch.nn.Module):
                     loss = torch.tensor(0.).to(dev)
                     collective_loss_dict = {}
                     collective_loss_dict["total_loss"] = torch.tensor(0.).to(dev)
+                    collective_loss_dict["conf_loss"] = torch.tensor(0.).to(dev)
                     #collective_loss_dict["loss_rel"] = torch.tensor(0.).to(dev)
                     collective_loss_dict["loss_prop_reg"] = torch.tensor(0.).to(dev)
+                    if self.include_collision_loss:
+                        collective_loss_dict["collision_loss"] = torch.tensor(0.).to(dev)
                     collective_res = []
                     start_timestep = 0
                     sum_timesteps_across_rollouts = 0
+                    
 
                     ctrs = dd['ctrs']
                     world_locs = dd['world_locs'] # location features (not offsets but absolute positions in SE(2)-transformed coordinate system) (past + future)
@@ -368,7 +380,10 @@ class FJMP(torch.nn.Module):
 
                     while start_timestep < self.prediction_steps:
                         dgl_graph = self.init_dgl_graph(dd['batch_idxs'], ctrs, dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], world_locs, has_preds).to(dev)
+                        confidence_graph = self.init_dgl_graph(dd['batch_idxs'], ctrs, dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], world_locs, has_preds).to(dev)
+
                         # only process observed features
+
                         dgl_graph = self.feature_encoder(dgl_graph, feats, dd['agenttypes'], dd['actor_idcs'], actor_ctrs, dd['lane_graph'])
 
                         if self.two_stage_training and self.training_stage == 2:
@@ -380,7 +395,7 @@ class FJMP(torch.nn.Module):
                         ig_dict["ig_labels"] = None
                         
                         # produces dictionary of results
-                        res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=prop_ground_truth, eval=False)
+                        res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=prop_ground_truth, eval=False, confidence_graph = confidence_graph)
                         
                         steps_before_replan = torch.randint(1, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
                         #print(hvd.rank(), steps_before_replan)
@@ -389,8 +404,11 @@ class FJMP(torch.nn.Module):
                         sum_timesteps_across_rollouts += (self.prediction_steps - start_timestep) # this term deals with the fact that some runs will attend over the same timestep multiple times. the sum of timesteps predicted is saved.
                         loss += loss_dict["total_loss"] # we total up the loss from each run.
                         collective_loss_dict["total_loss"] += loss_dict["total_loss"]
+                        collective_loss_dict["conf_loss"] += loss_dict["conf_loss"]
                         #collective_loss_dict["loss_rel"] += loss_dict["loss_rel"]
                         collective_loss_dict["loss_prop_reg"] += loss_dict["loss_prop_reg"]
+                        if self.include_collision_loss:
+                            collective_loss_dict["collision_loss"] += loss_dict["collision_loss"]
 
                         #here, we need to take the information to generate the starting position for the next step of the rollout
                         old_start_timestep = start_timestep
@@ -411,10 +429,21 @@ class FJMP(torch.nn.Module):
                         gt_locs = F.pad(gt_locs, padding, "constant", 0) # padding with zeroes
                         gt_psirads = F.pad(gt_psirads, padding, "constant", 0) # padding with zeroes
                         gt_vels = F.pad(gt_vels, padding, "constant", 0) # padding with zeroes
-
-                        argmin = loss_dict['argmin']
-
-                        #print(start_timestep)
+                        
+                        max_conf = torch.argmax(res['mode_conf'], dim = 1)
+                        # print(loss_dict['argmin'])
+                        # print(max_conf)
+                        # print(self.batch_size)
+                        # print(torch.sum(loss_dict['argmin'] == max_conf))
+                        correct_conf_sum += torch.sum(loss_dict['argmin'] == max_conf)
+                        total_conf_predictions += self.batch_size
+                        # print(correct_conf_sum / total_conf_predictions)
+                        # exit()
+                        collective_loss_dict['correct_conf_percentage'] = correct_conf_sum / total_conf_predictions
+                        if epoch < self.conf_switch:
+                            best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs
+                        else:
+                            best = max_conf # then we switch to our confidence predictor to use the mode with the heighest confidence
 
                         
                         # rotate things back into the SE-2 reference frame
@@ -424,13 +453,13 @@ class FJMP(torch.nn.Module):
                         # convert heading back into a rad
                         head_pred_se2 = torch.atan2(head_pred_se2[:, :, :, 1], head_pred_se2[:, :, :, 0]).unsqueeze(3) #first is y second is x
 
-                        # we want the first number in argmin to be repeated the number of times indicated in the first index of 'dgl_graph.batch_num_nodes()'
-                        repeated_argmins = argmin.repeat_interleave(dgl_graph.batch_num_nodes())
+                        # we want the first number in best to be repeated the number of times indicated in the first index of 'dgl_graph.batch_num_nodes()'
+                        repeated_bests = best.repeat_interleave(dgl_graph.batch_num_nodes())
                         
                         # Generate the indices for advanced indexing
                         vehicle_indices = torch.arange(loc_pred_se2.size(0)).unsqueeze(1)
                         time_indices = torch.arange(loc_pred_se2.size(1)).unsqueeze(0)
-                        mode_indices = repeated_argmins.unsqueeze(1) # selects the best mode up to time of replanning.
+                        mode_indices = repeated_bests.unsqueeze(1) # selects the best mode up to time of replanning.
 
                         # Use advanced indexing to select the desired elements
                         best_loc_se2 = loc_pred_se2[vehicle_indices, time_indices, mode_indices]
@@ -472,6 +501,7 @@ class FJMP(torch.nn.Module):
 
                     norm_term = self.prediction_steps / sum_timesteps_across_rollouts# play with this. it might be helping or hurting.
                     loss = loss * norm_term
+
                 else:
                     dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
                     # only process observed features
@@ -488,9 +518,10 @@ class FJMP(torch.nn.Module):
                     # produces dictionary of results
                     res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=prop_ground_truth, eval=False)
 
-                    loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'], dd['gt_locs'], dd['batch_size'], dd["ig_labels"], epoch)
+                    loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'], dd['gt_locs'], None, None, dd['batch_size'], dd["ig_labels"], epoch)
                     
                     loss = loss_dict["total_loss"]
+                    
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -501,7 +532,8 @@ class FJMP(torch.nn.Module):
                     if (self.two_stage_training and self.training_stage == 2):                    
                         print_("Training data: ", "{:.2f}%".format(i * 100 / tot_log), "lr={:.3e}".format(cur_lr), "rel_coef={:.1f}".format(self.rel_coef),
                             "\t".join([k + ":" + f"{v.item():.3f}" for k, v in collective_loss_dict.items()]), '\tavg_num_predictions: ' + f"{(inner_loops/outer_loops):.3f}")
-                    
+                        #print_('max_conf          ', max_conf, '\n', 'true best example', loss_dict['argmin'])
+
                     else:
                         print_("Training data: ", "{:.2f}%".format(i * 100 / tot_log), "lr={:.3e}".format(cur_lr), "rel_coef={:.1f}".format(self.rel_coef),
                             "\t".join([k + ":" + f"{v.item():.3f}" for k, v in loss_dict.items()]))
@@ -652,6 +684,8 @@ class FJMP(torch.nn.Module):
         with torch.no_grad():
             tot_log = self.num_val_samples // (self.batch_size * hvd.size())
             torch.manual_seed(0)
+            correct_conf_sum = 0
+            total_conf_predictions = 0
             for i, data in enumerate(val_loader):
                 dd = self.process(data)
 
@@ -659,8 +693,11 @@ class FJMP(torch.nn.Module):
                     loss = torch.tensor(0.).to(dev)
                     collective_loss_dict = {}
                     collective_loss_dict["total_loss"] = torch.tensor(0.).to(dev)
+                    collective_loss_dict["conf_loss"] = torch.tensor(0.).to(dev)
                     #collective_loss_dict["loss_rel"] = torch.tensor(0.).to(dev)
                     collective_loss_dict["loss_prop_reg"] = torch.tensor(0.).to(dev)
+                    if self.include_collision_loss:
+                        collective_loss_dict["collision_loss"] = torch.tensor(0.).to(dev)
                     collective_res = []
                     start_timestep = 0
                     sum_timesteps_across_rollouts = 0
@@ -677,6 +714,8 @@ class FJMP(torch.nn.Module):
 
                     while start_timestep < config['prediction_steps']:
                         dgl_graph = self.init_dgl_graph(dd['batch_idxs'], ctrs, dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], world_locs, has_preds).to(dev)
+                        confidence_graph = self.init_dgl_graph(dd['batch_idxs'], ctrs, dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], world_locs, has_preds).to(dev)
+
                         # only process observed features
                         dgl_graph = self.feature_encoder(dgl_graph, feats, dd['agenttypes'], dd['actor_idcs'], actor_ctrs, dd['lane_graph'])
 
@@ -689,16 +728,19 @@ class FJMP(torch.nn.Module):
                         ig_dict["ig_labels"] = None
                         
                         # produces dictionary of results
-                        res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=0., eval=True)
+                        res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=0., eval=True, confidence_graph = confidence_graph)
                         
                         steps_before_replan = torch.randint(1, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
                         loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], has_preds, gt_locs, gt_psirads, gt_vels, dd['batch_size'], dd["ig_labels"], epoch, steps = steps_before_replan)
-                        
+
                         sum_timesteps_across_rollouts += (self.prediction_steps - start_timestep) # this term deals with the fact that some runs will attend over the same timestep multiple times. the sum of timesteps predicted is saved.
                         loss += loss_dict["total_loss"] # we total up the loss from each run.
                         collective_loss_dict["total_loss"] += loss_dict["total_loss"]
+                        collective_loss_dict["conf_loss"] += loss_dict["conf_loss"]
                         #collective_loss_dict["loss_rel"] += loss_dict["loss_rel"]
                         collective_loss_dict["loss_prop_reg"] += loss_dict["loss_prop_reg"]
+                        if self.include_collision_loss:
+                            collective_loss_dict["collision_loss"] += loss_dict["collision_loss"]
 
                         #here, we need to take the information to generate the starting position for the next step of the rollout
                         old_start_timestep = start_timestep
@@ -720,7 +762,16 @@ class FJMP(torch.nn.Module):
                         gt_psirads = F.pad(gt_psirads, padding, "constant", 0) # padding with zeroes
                         gt_vels = F.pad(gt_vels, padding, "constant", 0) # padding with zeroes
 
-                        argmin = loss_dict['argmin']
+
+                        max_conf = torch.argmax(res['mode_conf'], dim = 1)
+                        correct_conf_sum += torch.sum(loss_dict['argmin'] == max_conf)
+                        total_conf_predictions += self.batch_size
+                        collective_loss_dict['correct_conf_percentage'] = correct_conf_sum / total_conf_predictions
+                        if epoch < self.conf_switch:
+                            best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs
+                        else:
+                            best = max_conf # then we switch to our confidence predictor to use the mode with the heighest confidence
+
 
                         #print(start_timestep)
 
@@ -734,13 +785,13 @@ class FJMP(torch.nn.Module):
  
                         
 
-                        # we want the first number in argmin to be repeated the number of times indicated in the first index of 'dgl_graph.batch_num_nodes()'
-                        repeated_argmins = argmin.repeat_interleave(dgl_graph.batch_num_nodes())
+                        # we want the first number in best to be repeated the number of times indicated in the first index of 'dgl_graph.batch_num_nodes()'
+                        repeated_bests = best.repeat_interleave(dgl_graph.batch_num_nodes())
                         
                         # Generate the indices for advanced indexing
                         vehicle_indices = torch.arange(loc_pred_se2.size(0)).unsqueeze(1)
                         time_indices = torch.arange(loc_pred_se2.size(1)).unsqueeze(0)
-                        mode_indices = repeated_argmins.unsqueeze(1) # selects the best mode up to time of replanning.
+                        mode_indices = repeated_bests.unsqueeze(1) # selects the best mode up to time of replanning.
 
                         # Use advanced indexing to select the desired elements
                         best_loc_se2 = loc_pred_se2[vehicle_indices, time_indices, mode_indices]
@@ -795,7 +846,7 @@ class FJMP(torch.nn.Module):
                     
                     res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=0., eval=True)
 
-                    loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'], dd['gt_locs'], dd['gt_psirads'], dd['gt_vels'], dd['batch_size'], dd["ig_labels"], epoch)
+                    loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'], dd['gt_locs'], None, None, dd['batch_size'], dd["ig_labels"], epoch)
                 
                 if i % 50 == 0:
                     if (self.two_stage_training and self.training_stage == 2):                    
@@ -1015,6 +1066,7 @@ class FJMP(torch.nn.Module):
         stage_1_graph.ndata["ctrs"] = graph.ndata["ctrs"]
         stage_1_graph.ndata["rot"] = graph.ndata["rot"]
         stage_1_graph.ndata["orig"] = graph.ndata["orig"]
+        stage_1_graph.ndata["shape"] = graph.ndata["shape"]
         stage_1_graph.ndata["agenttypes"] = graph.ndata["agenttypes"].float()
 
         stage_1_graph = self.pretrained_relation_header.feature_encoder(stage_1_graph, x, agenttypes, actor_idcs, actor_ctrs, lane_graph)
@@ -1029,7 +1081,7 @@ class FJMP(torch.nn.Module):
         plt.savefig('img/dag_{}_nocycles.png'.format(idx))
         plt.clf()
 
-    def forward(self, scene_idxs, graph, stage_1_graph, ig_dict, batch_idxs, batch_idxs_edges, actor_ctrs, ks=None, prop_ground_truth = 0., eval=True, idx_for_img = -1):
+    def forward(self, scene_idxs, graph, stage_1_graph, ig_dict, batch_idxs, batch_idxs_edges, actor_ctrs, ks=None, prop_ground_truth = 0., eval=True, idx_for_img = -1, confidence_graph = None):
         
         if self.learned_relation_header:
             edge_logits = self.relation_header(graph)
@@ -1063,8 +1115,7 @@ class FJMP(torch.nn.Module):
             dag_graph, proposals = self.proposal_decoder(dag_graph, actor_ctrs)
         
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
-            loc_pred, head_pred, vel_pred = self.trajectory_decoder(dag_graph, prop_ground_truth, batch_idxs)
-
+            loc_pred, head_pred, vel_pred, mode_conf = self.trajectory_decoder(dag_graph, confidence_graph, prop_ground_truth, batch_idxs)
         if idx_for_img != -1: #draws the interaction graph
             self.viz_interaction_graph(dag_graph, idx_for_img)##################################################################
         # loc_pred: shape [N, prediction_steps, num_joint_modes, 2]
@@ -1074,7 +1125,7 @@ class FJMP(torch.nn.Module):
             res["proposals"] = proposals # trajectory proposal future coordinates
         
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
-            ### IMPORTANT: I think this line needs to be made into 3 lines, one for each of the heads (position, heading, velocity)
+            res['mode_conf'] = mode_conf            
             res["loc_pred"] = loc_pred # predicted future coordinates
             res["head_pred"] = head_pred
             res["vel_pred"] = vel_pred
@@ -1141,6 +1192,7 @@ class FJMP(torch.nn.Module):
             loc_pred = res["loc_pred"]
             head_pred = res["head_pred"]
             vel_pred = res["vel_pred"]
+            mode_conf = res["mode_conf"]
             
             if not self.proposal_header:
                 if self.supervise_vehicles and self.dataset=='interaction':
@@ -1162,12 +1214,15 @@ class FJMP(torch.nn.Module):
             target_heading = torch.cat([torch.cos(target_heading), torch.sin(target_heading)], dim=3) #double check this
             assert target_heading.size(dim=3) == 2
             target_vel = torch.stack([gt_vels] * self.num_joint_modes, dim=2).to(dev)
-
+            #print(huber_loss(loc_pred, target))
+            #print(huber_loss(head_pred, target_heading))
+            #print(huber_loss(vel_pred, target_vel))
             # Regression loss
             reg_loss = huber_loss(loc_pred, target) + huber_loss(head_pred, target_heading) + huber_loss(vel_pred, target_vel)
 
             # 0 out loss for the indices that don't have a ground-truth prediction.
             reg_loss = reg_loss * has_preds_mask
+            
             auto_regressive_replan_limited_loss = reg_loss[:, :steps]#only take loss for steps that we are predicting for
 
             b_s = torch.zeros((batch_size, self.num_joint_modes)).to(reg_loss.device)
@@ -1190,78 +1245,97 @@ class FJMP(torch.nn.Module):
 
             min = min_package[0] # this part is the min
             argmin = min_limited_package[1] # this part is the argmin. We take it from the limited package since we want to use this to determine the next mode to pick, based only on how far we have gotten in the number of timesteps before we replan
+            # print(argmin.size())
+            # print(mode_conf.size())
+            # print(F.one_hot(argmin, num_classes = self.num_joint_modes).size())
+            # exit()
+            cross_entropy_loss = nn.CrossEntropyLoss()
+
+            conf_loss = cross_entropy_loss(mode_conf, argmin)
+            conf_loss = torch.sum(conf_loss)
             loss_reg = min.mean() #  we then take the mean of the mins. this forms our "winner takes all" loss
 
-            # Collision Loss !!! Under construction
-            # convert heading back into a rad
-            head_pred_psi_rad = torch.atan2(head_pred[:, :, :, 1], head_pred[:, :, :, 0]).unsqueeze(3) #first is y second is x
+            # if torch.isnan(loss_reg):
+            #     print('reg fails first')
+            #     exit()
+            # Collision Loss
+            if self.include_collision_loss: #this collision loss is only for stage 2. I will leave it to throw an error if you run it in stage one so you have an indicator
+                # convert heading back into a rad
+                head_pred_psi_rad = torch.atan2(head_pred[:, :, :, 1], head_pred[:, :, :, 0]).unsqueeze(3) #first is y second is x
 
-            # we want the first number in argmin to be repeated the number of times indicated in the first index of 'dgl_graph.batch_num_nodes()'
-            repeated_argmins = argmin.repeat_interleave(graph.batch_num_nodes())
-            
-            # Generate the indices for advanced indexing
-            vehicle_indices = torch.arange(loc_pred.size(0)).unsqueeze(1)
-            time_indices = torch.arange(loc_pred.size(1)).unsqueeze(0)
-            mode_indices = repeated_argmins.unsqueeze(1) # selects the best mode up to time of replanning.
-
-            # Use advanced indexing to select the desired elements
-            best_loc = loc_pred[vehicle_indices, time_indices, mode_indices]
-            best_head_psi_rad = head_pred_psi_rad[vehicle_indices, time_indices, mode_indices]
-
-            collision_loss = 0
-            count = 0
-            for i, batch_num_nodes_i in enumerate(graph.batch_num_nodes()):# batch num nodes returns the number of nodes for each graph (scenario) in the batch
-                batch_num_nodes_i = batch_num_nodes_i.item()
-
-                batch_best_loc = best_loc[count:count+batch_num_nodes_i]
-                batch_best_head_psi_rad = best_head_psi_rad[count:count+batch_num_nodes_i]
-                batch_shapes = shapes[count:count+batch_num_nodes_i]
-
-                # construct circles
-                veh_rad = batch_shapes[:, 1] / 2. # radius of the discs for each vehicle assuming length >= width
-                cent_min = -(batch_shapes[:, 0] / 2.) + veh_rad
-                cent_max = (batch_shapes[:, 0] / 2.) - veh_rad
-                num_circ = 5 #number of circles to represent each vehicles
-
-                cent_x = torch.stack([torch.linspace(cent_min[vidx].item(), cent_max[vidx].item(), num_circ) for vidx in range(batch_num_nodes_i)], dim=0)
-                centroids = torch.stack([cent_x, torch.zeros_like(cent_x)], dim=2).to(batch_best_head_psi_rad.device)
-
-                centroids = centroids.unsqueeze(1).expand(batch_num_nodes_i, self.prediction_steps, num_circ, 2)
-                batch_best_head_psi_rad = batch_best_head_psi_rad.unsqueeze(2)
+                # we want the first number in argmin to be repeated the number of times indicated in the first index of 'dgl_graph.batch_num_nodes()'
+                repeated_argmins = argmin.repeat_interleave(graph.batch_num_nodes())
                 
-                # rotate and shift circles to correct locations
-                rotated_centroids = torch.cat([centroids[:, :, :, 0].unsqueeze(3) * torch.cos(batch_best_head_psi_rad), centroids[:, :, :, 1].unsqueeze(3) * torch.sin(batch_best_head_psi_rad)], dim=3)
-                
-                rotated_shifted_centroids = batch_best_loc.unsqueeze(2) + rotated_centroids
-                print(rotated_shifted_centroids.size())
-                exit()
+                # Generate the indices for advanced indexing
+                vehicle_indices = torch.arange(loc_pred.size(0)).unsqueeze(1)
+                time_indices = torch.arange(loc_pred.size(1)).unsqueeze(0)
+                mode_indices = repeated_argmins.unsqueeze(1) # selects the best mode up to time of replanning.
 
-                #do collision check
-                NA, T, _1, _2 = rotated_shifted_centroids.size() #NA means num agents. T means time
-                world_cent = rotated_shifted_centroids.transpose(0, 1) # T x NA X C x 2
-                # distances between all pairs of circles between all pairs of agents
-                cur_cent1 = world_cent.view(T, NA, 1, self.num_circ, 2).expand(T, NA, NA, self.num_circ, 2).reshape(T*NA*NA, self.num_circ, 2)
-                cur_cent2 = world_cent.view(T, 1, NA, self.num_circ, 2).expand(T, NA, NA, self.num_circ, 2).reshape(T*NA*NA, self.num_circ, 2)
-                pair_dists = torch.cdist(cur_cent1, cur_cent2).view(T*NA*NA, self.num_circ*self.num_circ)
-                
-                # get minimum distance overall all circle pairs between each pair
-                min_pair_dists = torch.min(pair_dists, 1)[0].view(T, NA, NA)   
-                cur_penalty_dists = self.penalty_dists
+                # Use advanced indexing to select the desired elements
+                best_loc = loc_pred[vehicle_indices, time_indices, mode_indices]
+                best_head_psi_rad = head_pred_psi_rad[vehicle_indices, time_indices, mode_indices]
 
-                # diagonals are self collisions so ignore them
-                off_diag_mask = ~torch.eye(NA, dtype=torch.bool).to(self.veh_att.device)
+                collision_loss = 0
+                count = 0
+                for i, batch_num_nodes_i in enumerate(graph.batch_num_nodes()):# batch num nodes returns the number of nodes for each graph (scenario) in the batch
+                    batch_num_nodes_i = batch_num_nodes_i.item()
 
+                    batch_best_loc = best_loc[count:count+batch_num_nodes_i]
+                    batch_best_head_psi_rad = best_head_psi_rad[count:count+batch_num_nodes_i]
+                    batch_shapes = shapes[count:count+batch_num_nodes_i]
 
-                print(batch_num_nodes_i)
-                print(batch_best_loc.size())
-                print(shapes.size())
-                print(shapes[count:count+batch_num_nodes_i].size())
-                exit()
+                    # construct circles
+                    standard_pedestrien_diameter = 0.6 #pidestrien dimensions are zeros, so we need to manually fix them for accurate collisions and to avoid NANs
+                    veh_rad = torch.clamp(batch_shapes[:, 1], min=standard_pedestrien_diameter) / 2. # radius of the discs for each vehicle assuming length >= width
+                    cent_min = -(torch.clamp(batch_shapes[:, 0], min=standard_pedestrien_diameter) / 2.) + veh_rad 
+                    cent_max = (torch.clamp(batch_shapes[:, 0], min=standard_pedestrien_diameter) / 2.) - veh_rad
+                    num_circ = 5 #number of circles to represent each vehicles
 
-                collision_loss += 0
-                count += batch_num_nodes_i
+                    cent_x = torch.stack([torch.linspace(cent_min[vidx].item(), cent_max[vidx].item(), num_circ) for vidx in range(batch_num_nodes_i)], dim=0)
+                    centroids = torch.stack([cent_x, torch.zeros_like(cent_x)], dim=2).to(batch_best_head_psi_rad.device)
 
+                    centroids = centroids.unsqueeze(1).expand(batch_num_nodes_i, self.prediction_steps, num_circ, 2)
+                    batch_best_head_psi_rad = batch_best_head_psi_rad.unsqueeze(2)
+                    
+                    # rotate and shift circles to correct locations
+                    rotated_centroids = torch.cat([centroids[:, :, :, 0].unsqueeze(3) * torch.cos(batch_best_head_psi_rad), centroids[:, :, :, 1].unsqueeze(3) * torch.sin(batch_best_head_psi_rad)], dim=3)
+                    
+                    rotated_shifted_centroids = batch_best_loc.unsqueeze(2) + rotated_centroids
 
+                    #do collision check
+                    NA, T, _1, _2 = rotated_shifted_centroids.size() #NA means num agents. T means time
+                    world_cent = rotated_shifted_centroids.transpose(0, 1) # T x NA X C x 2
+                    # distances between all pairs of circles between all pairs of agents
+                    cur_cent1 = world_cent.view(T, NA, 1, num_circ, 2).expand(T, NA, NA, num_circ, 2).reshape(T*NA*NA, num_circ, 2)
+                    cur_cent2 = world_cent.view(T, 1, NA, num_circ, 2).expand(T, NA, NA, num_circ, 2).reshape(T*NA*NA, num_circ, 2)
+                    pair_dists = torch.cdist(cur_cent1, cur_cent2).view(T*NA*NA, num_circ*num_circ)
+                    
+                    # get minimum distance overall all circle pairs between each pair
+                    min_pair_dists = torch.min(pair_dists, 1)[0].view(T, NA, NA)   
+                    buffer_dist = 0
+                    penalty_dists = veh_rad.view(NA, 1).expand(NA, NA) + veh_rad.view(1, NA).expand(NA, NA) + buffer_dist
+                    cur_penalty_dists = penalty_dists
+
+                    cur_penalty_dists = cur_penalty_dists.view(1, NA, NA).to(batch_best_head_psi_rad.device)
+                    is_colliding_mask = min_pair_dists <= cur_penalty_dists
+
+                    # diagonals are self collisions so ignore them
+                    cur_off_diag_mask = ~torch.eye(NA, dtype=torch.bool).to(batch_best_head_psi_rad.device)
+
+                    is_colliding_mask = torch.logical_and(is_colliding_mask, cur_off_diag_mask.view(1, NA, NA))
+
+                    # penalty is inverse normalized distance apart for those already colliding
+                    cur_penalties = 1.0 - (min_pair_dists / cur_penalty_dists)
+
+                    cur_penalties = cur_penalties[is_colliding_mask]
+
+                    collision_loss += torch.sum(cur_penalties)
+                    count += batch_num_nodes_i
+        # if torch.isnan(collision_loss):
+        #     print('coll fails first')
+        #     exit()
+        # print(loss_reg, collision_loss)
+        
         # Relation Loss
         if self.learned_relation_header:
             if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 1):
@@ -1309,15 +1383,22 @@ class FJMP(torch.nn.Module):
 
             else:
                 loss = loss_reg
-                loss += collision_loss
+                loss += conf_loss
+                if self.include_collision_loss and epoch >= self.activate_collision_loss:
+                    collision_loss_weight = 0.5
+                    loss += collision_loss_weight * collision_loss * ((epoch - self.activate_collision_loss) / (self.max_epochs - self.activate_collision_loss)) #trying to gently add the loss
+                    #loss += 0 #we are running atest to see if the collision loss reduces on its own to the same level !CHANGE!!!!!!
+
                 if self.proposal_header:
                     loss = loss + loss_prop_reg * self.proposal_coef
                 
                 loss_dict = {"total_loss": loss,
-                             "loss_reg": loss_reg} 
+                             "loss_reg": loss_reg}
                 
                 loss_dict["argmin"] = argmin
-                loss_dict["collision_loss"] = collision_loss
+                loss_dict["conf_loss"] = conf_loss
+                if self.include_collision_loss:
+                    loss_dict["collision_loss"] = collision_loss
                              
                 if self.proposal_header:
                     loss_dict["loss_prop_reg"] = loss_prop_reg * self.proposal_coef
@@ -1487,6 +1568,7 @@ if __name__ == '__main__':
     config["eval_training"] = args.eval_training
     config["supervise_vehicles"] = args.supervise_vehicles
     config["no_agenttype_encoder"] = args.no_agenttype_encoder 
+    config["include_collision_loss"] = args.include_collision_loss
     config["train_all"] = args.train_all
 
     config["log_path"].mkdir(exist_ok=True, parents=True)
@@ -1502,6 +1584,8 @@ if __name__ == '__main__':
         config["num_val_samples"] = 11794
         config["switch_lr_1"] = 40
         config["switch_lr_2"] = 48
+        config["activate_collision_loss"] = 11
+        config['conf_switch'] = 11
         config["lr_step"] = 1/5
         config["input_size"] = 5
         config["prediction_steps"] = 30 
