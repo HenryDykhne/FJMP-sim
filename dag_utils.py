@@ -46,11 +46,15 @@ def prune_graph_johnson(dag_graph):
 
     # First identify cycles in graph
     eids = []
+    count_cycles = 0
     for cycle in cycles:
         out_cycle = torch.Tensor(cycle).to(dag_graph.device).long()
         in_cycle = torch.roll(out_cycle, 1)
 
         eids.append(dag_graph.edge_ids(in_cycle, out_cycle))
+
+        count_cycles += 1
+    print(count_cycles)
 
     to_remove = []
     while len(eids) > 0:

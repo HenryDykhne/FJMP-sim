@@ -233,7 +233,7 @@ class PreprocessDataset():
     def __getitem__(self, idx):
         data = self.stores[idx]
         graph = dict()
-        for key in ['lane_idcs', 'ctrs', 'pre_pairs', 'suc_pairs', 'left_pairs', 'right_pairs', 'feats', 'centerlines', 'left_boundaries', 'right_boundaries']:
+        for key in ['lane_idcs', 'ctrs', 'pre_pairs', 'suc_pairs', 'left_pairs', 'right_pairs', 'feats', 'centerlines', 'left_boundaries', 'right_boundaries', 'drivable_polygons']:
             graph[key] = ref_copy(data['graph'][key])
         graph['idx'] = idx
         # returns a subset of the graph information

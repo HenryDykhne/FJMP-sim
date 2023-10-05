@@ -95,6 +95,17 @@ class Argoverse2Dataset(Dataset):
                 if key in data:
                     new_data[key] = ref_copy(data[key])
             
+            shapes = [] # we are adding the lengths and widths
+            for i in range(new_data['feat_locs'].shape[0]):
+                length = self.avg_agent_length[new_data['feat_agenttypes'][i, (PAST_LENGTH - 1), 0]]
+                width = self.avg_agent_width[new_data['feat_agenttypes'][i, (PAST_LENGTH - 1), 0]]
+                shapes.append(np.array([length, width]))
+            shapes = np.vstack(shapes)
+            shapes = np.expand_dims(shapes, axis=1)
+            shapes = np.repeat(shapes, PAST_LENGTH, axis=1)
+
+            new_data['feat_shapes'] = shapes # vehicle [length,width] (past)
+            
             data = new_data 
 
             return data
