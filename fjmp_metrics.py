@@ -273,6 +273,7 @@ def calc_metrics(results, config, mask, identifier):
         proposals = results["proposals_all"][mask]
     if (not config['two_stage_training']) or (config['two_stage_training'] and config['training_stage'] == 2):
         loc_pred = results['loc_pred'][mask]  
+        ts_loss = results['ts_loss']
     
     n_scenarios = np.unique(batch_idxs).shape[0]
     scenarios = np.unique(batch_idxs).astype(int)
@@ -362,6 +363,7 @@ def calc_metrics(results, config, mask, identifier):
         if identifier == 'reg':
             FDE = mean_FDE.min(1).mean()
             ADE = mean_ADE.min(1).mean()
+            TS_LOSS = torch.cat(ts_loss).mean()
 
             # initialize to -1
             best_modes = np.ones(n_scenes_before_mask) * -1
@@ -379,6 +381,7 @@ def calc_metrics(results, config, mask, identifier):
         # default values for when training stage = 1
         FDE = 0
         ADE = 0
+        TS_LOSS = 0
         scr = 0
         smr = 0
         smr_av2 = 0
@@ -399,7 +402,8 @@ def calc_metrics(results, config, mask, identifier):
 
     results = {
         "FDE": FDE,
-        "ADE": ADE}
+        "ADE": ADE,
+        "TS_LOSS": TS_LOSS}
 
     if config["proposal_header"] and identifier == 'reg':
         results["pFDE"] = pFDE

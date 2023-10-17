@@ -59,10 +59,10 @@ def sync3(data, comm):
     for i in range(len(data_list)):
         if i == 0:
             for key in data_list[i].keys():
-                final_grads[key] = data_list[i][key]
+                final_grads[key] = data_list[i][key]#.to(torch.device('cuda:0'))
         else:
             for key in data_list[i].keys():
-                final_grads[key] += data_list[i][key]
+                final_grads[key] += data_list[i][key]#.to(torch.device('cuda:0'))
     
     for key in final_grads.keys():
         final_grads[key] /= len(data_list)
@@ -74,6 +74,7 @@ def sync(data, config, comm):
     
     FDE = 0
     ADE = 0
+    TS_LOSS = 0
     SCR = 0
     SMR = 0
     SMR_AV2 = 0
@@ -83,6 +84,7 @@ def sync(data, config, comm):
     for i in range(len(data_list)):
         FDE += data_list[i]['FDE'] * data_list[i]['n_scenarios']
         ADE += data_list[i]['ADE'] * data_list[i]['n_scenarios']
+        TS_LOSS += data_list[i]['TS_LOSS'] * data_list[i]['n_scenarios']
         SCR += data_list[i]['SCR'] * data_list[i]['n_scenarios']
         SMR += data_list[i]['SMR'] * data_list[i]['n_scenarios']
         SMR_AV2 += data_list[i]['SMR_AV2'] * data_list[i]['n_scenarios']
@@ -92,6 +94,7 @@ def sync(data, config, comm):
     
     FDE /= n_scenarios
     ADE /= n_scenarios
+    TS_LOSS /= n_scenarios
     SCR /= n_scenarios
     SMR /= n_scenarios
     SMR_AV2 /= n_scenarios
@@ -122,6 +125,7 @@ def sync(data, config, comm):
     return_dict = {
         'FDE': FDE,
         'ADE': ADE,
+        'TS_LOSS': TS_LOSS,
         'pFDE': pFDE,
         'pADE': pADE,
         'SCR': SCR,

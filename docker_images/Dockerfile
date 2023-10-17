@@ -10,6 +10,7 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86
 RUN dpkg -i cuda-keyring_1.0-1_all.deb
 
 ENV LANG C.UTF-8
+ENV SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL=True
 
 ENV OS=ubuntu2004
 ARG cuda_version=cuda11.1
@@ -150,7 +151,10 @@ RUN APT_INSTALL="apt-get install -y --no-install-recommends" && \
         pytorch-lightning==1.8.6 \
         captum==0.6.0 \
         && \
-
+    $PIP_INSTALL \
+        torch-scatter==2.0.9 \
+        -f https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CU_VERSION}.html \
+        && \
     HOROVOD_GPU_OPERATIONS=NCCL pip install horovod==0.19.4 && \
 
     pip install lanelet2 && \

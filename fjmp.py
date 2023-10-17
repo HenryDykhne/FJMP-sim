@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fjmp_dataloader_interaction import InteractionDataset
 from fjmp_dataloader_argoverse2 import Argoverse2Dataset
-from fjmp_modules import *
+
 from fjmp_utils import *
 from dag_utils import *
 from fjmp_metrics import *
@@ -70,6 +70,8 @@ os.environ['CUDA_VISIBLE_DEVICES'] = str(hvd.local_rank() + GPU_START)
 dev = 'cuda:{}'.format(0)
 torch.cuda.set_device(0)
 
+from fjmp_modules import * #this needs to be imported lower than os.environ['CUDA_VISIBLE_DEVICES'] = str(hvd.local_rank() + GPU_START) because fjmp_modules imports torch scatter and this causes issues for the visibility
+
 seed = hvd.rank()
 set_seeds(seed)
 
@@ -90,7 +92,7 @@ class FJMP(torch.nn.Module):
         self.observation_steps = config["observation_steps"]
         self.prediction_steps = config["prediction_steps"]
         self.rollout_steps = config["rollout_steps"] if "rollout_steps" in config else 120
-        self.replan_frequency = config["replan_frequency"] if "replan_frequency" in config else int(self.rollout_steps/3)
+        self.replan_frequency = config["replan_frequency"] if "replan_frequency" in config else int(self.rollout_steps / 4)
         self.num_edge_types = config["num_edge_types"]
         self.h_dim = config["h_dim"]
         self.num_joint_modes = config["num_joint_modes"]
@@ -121,7 +123,7 @@ class FJMP(torch.nn.Module):
         self.no_agenttype_encoder = config["no_agenttype_encoder"]
         self.include_collision_loss = config["include_collision_loss"] if ("include_collision_loss" in config) else False #just cause im using a first stage that was trained before this was a feature, so the old config was loaded. #REMOVE AFTER RETRAINING STAGE 1
         self.train_all = config["train_all"]
-        self.conf_switch = config['conf_switch'] if ("conf_switch" in config) else False #just cause im using a first stage that was trained before this was a feature, so the old config was loaded. #REMOVE AFTER RETRAINING STAGE 1
+        self.conf_switch = config['conf_switch'] if ("conf_switch" in config) else 11 #just cause im using a first stage that was trained before this was a feature, so the old config was loaded. #REMOVE AFTER RETRAINING STAGE 1
         
         if self.two_stage_training and self.training_stage == 2:
             self.pretrained_relation_header = None
@@ -318,7 +320,7 @@ class FJMP(torch.nn.Module):
             tot_log = self.num_train_samples // (self.batch_size * hvd.size())  
 
             results = {}
-            loc_preds, gt_locs_all, batch_idxs_all, has_preds_all, has_last_all = [], [], [], [], []
+            loc_preds, gt_locs_all, batch_idxs_all, has_preds_all, has_last_all, ts_loss = [], [], [], [], [], []
             gt_psirads_all, shapes_all, agenttypes_all, gt_ctrs_all, gt_psirads_all, feat_psirads_all, gt_vels_all, theta_all = [], [], [], [], [], [], [], []
             is_scored_all = []
 
@@ -349,19 +351,20 @@ class FJMP(torch.nn.Module):
             torch.manual_seed(0)
             correct_conf_sum = 0
             total_conf_predictions = 0
-            for i, data in enumerate(train_loader):      
+            for i, data in enumerate(train_loader): 
                 #random.seed(hvd.rank() * 100 + i * 10)
                 # get data dictionary for processing batch
+                # if i > 5:
+                #     break
                 dd = self.process(data)
 
                 if (self.two_stage_training and self.training_stage == 2):
-                    loss = torch.tensor(0.).to(dev)
                     collective_loss_dict = {}
                     collective_loss_dict["total_loss"] = torch.tensor(0.).to(dev)
                     collective_loss_dict["loss_reg"] = torch.tensor(0.).to(dev)
                     collective_loss_dict["conf_loss"] = torch.tensor(0.).to(dev)
                     #collective_loss_dict["loss_rel"] = torch.tensor(0.).to(dev)
-                    collective_loss_dict["loss_prop_reg"] = torch.tensor(0.).to(dev)
+                    #collective_loss_dict["loss_prop_reg"] = torch.tensor(0.).to(dev)
                     if self.include_collision_loss:
                         collective_loss_dict["collision_loss"] = torch.tensor(0.).to(dev)
                     collective_res = {}
@@ -399,7 +402,7 @@ class FJMP(torch.nn.Module):
                         ig_dict["ig_labels"] = None
                         
                         # produces dictionary of results
-                        res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=prop_ground_truth, eval=False, confidence_graph = confidence_graph)
+                        res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=prop_ground_truth, eval=False, confidence_graph = confidence_graph, loop = start_timestep)
                         
                         #steps_before_replan = torch.randint(1, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
                         steps_before_replan = self.replan_frequency
@@ -410,7 +413,7 @@ class FJMP(torch.nn.Module):
                         collective_loss_dict["loss_reg"] += loss_dict["loss_reg"]
                         collective_loss_dict["conf_loss"] += loss_dict["conf_loss"]
                         #collective_loss_dict["loss_rel"] += loss_dict["loss_rel"]
-                        collective_loss_dict["loss_prop_reg"] += loss_dict["loss_prop_reg"]
+                        #collective_loss_dict["loss_prop_reg"] += loss_dict["loss_prop_reg"]
 
                         #here, we need to take the information to generate the starting position for the next step of the rollout
                         old_start_timestep = start_timestep
@@ -442,8 +445,11 @@ class FJMP(torch.nn.Module):
                         # print(correct_conf_sum / total_conf_predictions)
                         # exit()
                         collective_loss_dict['correct_conf_percentage'] = correct_conf_sum / total_conf_predictions
-                        if epoch < self.conf_switch:
-                            best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs
+
+                        probability = 1 - (epoch - 1) / (self.max_epochs - 1)   
+                        use_gt = random.random() < probability
+                        if use_gt:
+                            best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs (we anneal this)
                         else:
                             best = max_conf # then we switch to our confidence predictor to use the mode with the heighest confidence
 
@@ -509,15 +515,13 @@ class FJMP(torch.nn.Module):
                     collective_res["vel_pred"] = torch.cat(collective_res["vel_pred"], dim = 1)
 
                     norm_term = 0.1 * self.rollout_steps / sum_timesteps_across_rollouts# play with this. it might be helping or hurting.
-                    trafficsim_loss = self.get_trafficsim_style_loss(dgl_graph, dd['batch_idxs'], collective_res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'],  dd['gt_locs'], dd['gt_psirads'], dd['gt_vels'], dd['batch_size'], dd["ig_labels"], epoch)
+                    #start = time.time()
+                    trafficsim_loss, reg_loss, collision_loss = self.get_trafficsim_style_loss(dgl_graph, dd['batch_idxs'], collective_res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'],  dd['gt_locs'], dd['gt_psirads'], dd['gt_vels'], dd['batch_size'], dd["ig_labels"], epoch)
+                    #print('trafficsimloss time', time.time() - start)
                     loss = trafficsim_loss + norm_term * collective_loss_dict["loss_reg"] + collective_loss_dict["conf_loss"]
-                    
-                    # print(trafficsim_loss)
-                    # print(norm_term *collective_loss_dict["loss_reg"])
-                    # print(collective_loss_dict["conf_loss"])
-                    # exit()
-                    
                     collective_loss_dict['trafficsim_loss'] = trafficsim_loss
+                    collective_loss_dict['reg_loss'] = reg_loss
+                    collective_loss_dict['collision_loss'] = collision_loss
                     collective_loss_dict['total_loss'] = loss
                 else:
                     dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
@@ -539,30 +543,35 @@ class FJMP(torch.nn.Module):
                     
                     loss = loss_dict["total_loss"]
                     
-
+                #start = time.time()
                 optimizer.zero_grad()
                 loss.backward()
                 accum_gradients = accumulate_gradients(accum_gradients, self.named_parameters())
                 optimizer.step()
+                #print('backprop+step time', time.time() - start)
                 
                 if i % 100 == 0:
+                    if i == 0:
+                        last = time.time()
                     if (self.two_stage_training and self.training_stage == 2):                    
                         print_("Training data: ", "{:.2f}%".format(i * 100 / tot_log), "lr={:.3e}".format(cur_lr), "rel_coef={:.1f}".format(self.rel_coef),
-                            "\t".join([k + ":" + f"{v.item():.3f}" for k, v in collective_loss_dict.items()]), '\tavg_num_predictions: ' + f"{(inner_loops/outer_loops):.3f}")
+                            "\t".join([k + ":" + f"{v.item():.2f}" for k, v in collective_loss_dict.items()]), '\tavg_num_predictions: ' + f"{(inner_loops/outer_loops):.1f}", '\tseconds_taken: ', "{:.2f}".format(time.time() - last))
                         #print_('max_conf          ', max_conf, '\n', 'true best example', loss_dict['argmin'])
 
                     else:
                         print_("Training data: ", "{:.2f}%".format(i * 100 / tot_log), "lr={:.3e}".format(cur_lr), "rel_coef={:.1f}".format(self.rel_coef),
-                            "\t".join([k + ":" + f"{v.item():.3f}" for k, v in loss_dict.items()]))
+                            "\t".join([k + ":" + f"{v.item():.2f}" for k, v in loss_dict.items()]), '\tseconds_taken: ', "{:.2f}".format(time.time() - last))
+                    last = time.time()
 
                 if self.eval_training:
                     if self.proposal_header:
                         proposals_all.append(res["proposals"].detach().cpu())
                     
                     if (self.two_stage_training and self.training_stage == 2):
-                        c_res = collective_res["loc_pred"][:, :self.prediction_steps]
-                        c_res = c_res.unsqueeze(2).repeat(1, 1, 6, 1)
-                        loc_preds.append(c_res.detach().cpu())
+                        c_res = collective_res["loc_pred"][:, :self.prediction_steps].detach()
+                        c_res = c_res.unsqueeze(2).repeat(1, 1, self.num_joint_modes, 1)
+                        loc_preds.append(c_res.cpu())
+                        ts_loss.append(collective_loss_dict['trafficsim_loss'].detach().cpu().reshape(1))
                     
                     if (not self.two_stage_training):
                         loc_preds.append(res['loc_pred'].detach().cpu())
@@ -623,6 +632,7 @@ class FJMP(torch.nn.Module):
                 if self.proposal_header:
                     results["proposals_all"] = np.concatenate(proposals_all, axis=0)
                 if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
+                    results['ts_loss'] = ts_loss
                     results['loc_pred'] = np.concatenate(loc_preds, axis=0)    
                 if self.learned_relation_header:
                     results['ig_preds'] = np.concatenate(ig_preds, axis=0)
@@ -653,16 +663,17 @@ class FJMP(torch.nn.Module):
                 
                 print_("Epoch {} validation-set results: ".format(epoch), "\t".join([f"{k}: {v}" if type(v) is np.ndarray else f"{k}: {v:.3f}" for k, v in val_eval_results.items()]))
                 
-                # Best model is one with minimum FDE + ADE
+                # Best model is one with minimum TS_LOSS
                 if hvd.rank() == 0:
                     if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
-                        if (val_eval_results["FDE"] + val_eval_results["ADE"]) < val_best:
-                            val_best = val_eval_results["FDE"] + val_eval_results["ADE"]
+                        if val_eval_results['TS_LOSS'].item() < val_best:
+                            val_best = val_eval_results['TS_LOSS'].item()
                             ade_best = val_eval_results["ADE"]
                             fde_best = val_eval_results["FDE"]
+                            print('test1')
                             self.save(epoch, optimizer, val_best, ade_best, fde_best)
-                            print_("Validation FDE+ADE improved. Saving model. ")
-                        print_("Best loss: {:.4f}".format(val_best), "Best ADE: {:.3f}".format(ade_best), "Best FDE: {:.3f}".format(fde_best))
+                            print_("Validation TS_LOSS improved. Saving model. ")
+                        print_("Best TS_LOSS: {:.4f}".format(val_best), "Associated ADE: {:.3f}".format(ade_best), "Associated FDE: {:.3f}".format(fde_best))
 
                     else:
                         if val_eval_results["E-Acc"] > val_edge_acc_best:
@@ -685,7 +696,7 @@ class FJMP(torch.nn.Module):
         self.eval()
         # validation results
         results = {}
-        loc_preds, gt_locs_all, batch_idxs_all, scene_idxs_all, has_preds_all, has_last_all = [], [], [], [], [], []
+        loc_preds, gt_locs_all, batch_idxs_all, scene_idxs_all, has_preds_all, has_last_all, ts_loss = [], [], [], [], [], [], []
         feat_psirads_all, gt_psirads_all, gt_vels_all, shapes_all, agenttypes_all, gt_ctrs_all, is_connected_all = [], [], [], [], [], [], []
         theta_all = []
         is_scored_all = []
@@ -704,16 +715,17 @@ class FJMP(torch.nn.Module):
             correct_conf_sum = 0
             total_conf_predictions = 0
             for i, data in enumerate(val_loader):
+                # if i > 5:
+                #     break
                 dd = self.process(data)
 
                 if (self.two_stage_training and self.training_stage == 2):
-                    loss = torch.tensor(0.).to(dev)
                     collective_loss_dict = {}
                     collective_loss_dict["total_loss"] = torch.tensor(0.).to(dev)
                     collective_loss_dict["conf_loss"] = torch.tensor(0.).to(dev)
                     #collective_loss_dict["loss_rel"] = torch.tensor(0.).to(dev)
                     collective_loss_dict["loss_reg"] = torch.tensor(0.).to(dev)
-                    collective_loss_dict["loss_prop_reg"] = torch.tensor(0.).to(dev)
+                    #collective_loss_dict["loss_prop_reg"] = torch.tensor(0.).to(dev)
                     if self.include_collision_loss:
                         collective_loss_dict["collision_loss"] = torch.tensor(0.).to(dev)
                     collective_res = {}
@@ -760,7 +772,7 @@ class FJMP(torch.nn.Module):
                         collective_loss_dict["loss_reg"] += loss_dict["loss_reg"]
                         collective_loss_dict["conf_loss"] += loss_dict["conf_loss"]
                         #collective_loss_dict["loss_rel"] += loss_dict["loss_rel"]
-                        collective_loss_dict["loss_prop_reg"] += loss_dict["loss_prop_reg"]
+                        #collective_loss_dict["loss_prop_reg"] += loss_dict["loss_prop_reg"]
                         
                         #here, we need to take the information to generate the starting position for the next step of the rollout
                         old_start_timestep = start_timestep
@@ -787,8 +799,11 @@ class FJMP(torch.nn.Module):
                         correct_conf_sum += torch.sum(loss_dict['argmin'] == max_conf)
                         total_conf_predictions += self.batch_size
                         collective_loss_dict['correct_conf_percentage'] = correct_conf_sum / total_conf_predictions
-                        if epoch < self.conf_switch:
-                            best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs
+                        
+                        probability = 1 - (epoch - 1) / (self.max_epochs - 1)   
+                        use_gt = random.random() < probability
+                        if use_gt:
+                            best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs (we anneal this)
                         else:
                             best = max_conf # then we switch to our confidence predictor to use the mode with the heighest confidence
 
@@ -859,9 +874,11 @@ class FJMP(torch.nn.Module):
                     collective_res["vel_pred"] = torch.cat(collective_res["vel_pred"], dim = 1)
 
                     norm_term = 0.1 * self.rollout_steps / sum_timesteps_across_rollouts# play with this. it might be helping or hurting.
-                    trafficsim_loss = self.get_trafficsim_style_loss(dgl_graph, dd['batch_idxs'], collective_res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'],  dd['gt_locs'], dd['gt_psirads'], dd['gt_vels'], dd['batch_size'], dd["ig_labels"], epoch)
+                    trafficsim_loss, reg_loss, collision_loss = self.get_trafficsim_style_loss(dgl_graph, dd['batch_idxs'], collective_res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'],  dd['gt_locs'], dd['gt_psirads'], dd['gt_vels'], dd['batch_size'], dd["ig_labels"], epoch)
                     loss = trafficsim_loss + norm_term * collective_loss_dict["loss_reg"] + collective_loss_dict["conf_loss"]
                     collective_loss_dict['trafficsim_loss'] = trafficsim_loss
+                    collective_loss_dict['reg_loss'] = reg_loss
+                    collective_loss_dict['collision_loss'] = collision_loss
                     collective_loss_dict['total_loss'] = loss
                 else:
                     dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
@@ -881,18 +898,21 @@ class FJMP(torch.nn.Module):
                     loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'], dd['gt_locs'], None, None, dd['batch_size'], dd["ig_labels"], epoch)
                 
                 if i % 50 == 0:
+                    if i == 0:
+                        last = time.time()
                     if (self.two_stage_training and self.training_stage == 2):                    
-                        print_("Validation data: ", "{:.2f}%".format(i * 100 / tot_log), "\t".join([k + ":" + f"{v.item():.3f}" for k, v in collective_loss_dict.items()]))
+                        print_("Validation data: ", "{:.2f}%".format(i * 100 / tot_log), "\t".join([k + ":" + f"{v.item():.2f}" for k, v in collective_loss_dict.items()]), '\tseconds_taken: ', "{:.2f}".format(time.time() - last))
                     else:
-                        print_("Validation data: ", "{:.2f}%".format(i * 100 / tot_log), "\t".join([k + ":" + f"{v.item():.3f}" for k, v in loss_dict.items()]))
-
+                        print_("Validation data: ", "{:.2f}%".format(i * 100 / tot_log), "\t".join([k + ":" + f"{v.item():.2f}" for k, v in loss_dict.items()]), '\tseconds_taken: ', "{:.2f}".format(time.time() - last))
+                    last = time.time()
                 if self.proposal_header:
                     proposals_all.append(res["proposals"].detach().cpu())
                 
                 if (self.two_stage_training and self.training_stage == 2):
-                    c_res = collective_res["loc_pred"][:, :self.prediction_steps]
-                    c_res = c_res.unsqueeze(2).repeat(1, 1, 6, 1)
-                    loc_preds.append(c_res.detach().cpu())
+                    c_res = collective_res["loc_pred"][:, :self.prediction_steps].detach()
+                    c_res = c_res.unsqueeze(2).repeat(1, 1, self.num_joint_modes, 1)
+                    loc_preds.append(c_res.cpu())
+                    ts_loss.append(collective_loss_dict['trafficsim_loss'].detach().cpu().reshape(1))
 
                 if (not self.two_stage_training):
                     loc_preds.append(res['loc_pred'].detach().cpu())##hold on
@@ -947,6 +967,7 @@ class FJMP(torch.nn.Module):
         if self.proposal_header:
             results["proposals_all"] = np.concatenate(proposals_all, axis=0)
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
+            results['ts_loss'] = ts_loss
             results['loc_pred'] = np.concatenate(loc_preds, axis=0)    
         if self.learned_relation_header:
             results['ig_preds'] = np.concatenate(ig_preds, axis=0)
@@ -957,6 +978,7 @@ class FJMP(torch.nn.Module):
             
             all_val_eval_results = calc_metrics(results, self.config, mask, identifier='reg')
             all_val_eval_results = sync(all_val_eval_results, self.config, comm)
+            
         else:      
             all_val_eval_results = {}
             
@@ -969,6 +991,7 @@ class FJMP(torch.nn.Module):
             if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
                 all_val_eval_results['FDE'] = val_eval_results['FDE']
                 all_val_eval_results['ADE'] = val_eval_results['ADE']
+                all_val_eval_results['TS_LOSS'] = val_eval_results['TS_LOSS']
                 all_val_eval_results['SMR'] = val_eval_results['SMR']
                 all_val_eval_results['SMR_AV2'] = val_eval_results['SMR_AV2']
                 all_val_eval_results['SCR'] = val_eval_results['SCR']
@@ -1113,7 +1136,7 @@ class FJMP(torch.nn.Module):
         plt.savefig('img/dag_{}_nocycles.png'.format(idx))
         plt.clf()
 
-    def forward(self, scene_idxs, graph, stage_1_graph, ig_dict, batch_idxs, batch_idxs_edges, actor_ctrs, ks=None, prop_ground_truth = 0., eval=True, idx_for_img = -1, confidence_graph = None):
+    def forward(self, scene_idxs, graph, stage_1_graph, ig_dict, batch_idxs, batch_idxs_edges, actor_ctrs, ks=None, prop_ground_truth = 0., eval=True, idx_for_img = -1, confidence_graph = None, loop = None):
         
         if self.learned_relation_header:
             edge_logits = self.relation_header(graph)
@@ -1141,7 +1164,12 @@ class FJMP(torch.nn.Module):
         dag_graph = build_dag_graph(graph, self.config)
         
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
-            dag_graph = prune_graph_johnson(dag_graph)
+            temp_g = prune_graph_johnson(dag_graph, scene_idxs)
+            if temp_g == None:
+                print(loop)
+                self.viz_interaction_graph(dag_graph, 0)
+                exit()
+            dag_graph = temp_g
         
         if self.proposal_header:
             dag_graph, proposals = self.proposal_decoder(dag_graph, actor_ctrs)
@@ -1258,10 +1286,9 @@ class FJMP(torch.nn.Module):
             batch_shapes = shapes[count:count+batch_num_nodes_i]
 
             # construct circles
-            standard_pedestrien_diameter = 0.6 #pedestrien dimensions are zeros, so we need to manually fix them for accurate collisions and to avoid NANs
-            veh_rad = torch.clamp(batch_shapes[:, 1], min=standard_pedestrien_diameter) / 2. # radius of the discs for each vehicle assuming length >= width
-            cent_min = -(torch.clamp(batch_shapes[:, 0], min=standard_pedestrien_diameter) / 2.) + veh_rad 
-            cent_max = (torch.clamp(batch_shapes[:, 0], min=standard_pedestrien_diameter) / 2.) - veh_rad
+            veh_rad = batch_shapes[:, 1] / 2. # radius of the discs for each vehicle assuming length >= width
+            cent_min = -(batch_shapes[:, 0] / 2.) + veh_rad 
+            cent_max = (batch_shapes[:, 0] / 2.) - veh_rad
             num_circ = 5 #number of circles to represent each vehicles
 
             cent_x = torch.stack([torch.linspace(cent_min[vidx].item(), cent_max[vidx].item(), num_circ) for vidx in range(batch_num_nodes_i)], dim=0)
@@ -1310,9 +1337,9 @@ class FJMP(torch.nn.Module):
 
             count += batch_num_nodes_i
 
-        trafficsim_loss = reg_loss + collision_loss
+        trafficsim_loss = reg_loss + collision_loss #testing to see if collision loss is what is screwing us up
 
-        return trafficsim_loss
+        return trafficsim_loss, reg_loss, collision_loss
         
 
     def get_loss(self, graph, batch_idxs, res, agenttypes, shapes, has_preds, gt_locs, gt_psirads, gt_vels, batch_size, ig_labels, epoch, steps = None):
@@ -1363,8 +1390,8 @@ class FJMP(torch.nn.Module):
         
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
             ### Regression Loss
-            # has_preds: [N, 30]
-            # res["loc_pred"]: [N, 30, 6, 2]
+            # has_preds: [N, self.prediction_steps]
+            # res["loc_pred"]: [N, self.prediction_steps, self.num_joint_modes, 2]
             has_preds_mask = has_preds.unsqueeze(-1).unsqueeze(-1)
             has_preds_mask = has_preds_mask.expand(has_preds_mask.shape[0], has_preds_mask.shape[1], self.num_joint_modes, 2).bool().to(dev)
             
@@ -1747,7 +1774,7 @@ if __name__ == '__main__':
         config["prediction_steps"] = 80
         config["observation_steps"] = 30
         config["rollout_steps"] = 120
-        config["replan_frequency"] = int(config["rollout_steps"] / 3) # our replan frequency comes down to 4 seconds
+        config["replan_frequency"] = int(config["rollout_steps"] / 4) # our replan frequency comes down to 3 seconds
         config["num_agenttypes"] = 5
         config['dataset_path'] = 'dataset_AV2'
         config['files_train'] = os.path.join(config['dataset_path'], 'train')

@@ -148,15 +148,15 @@ class FJMPFeatureEncoder(nn.Module):
 
     def forward(self, graph, x, agenttypes, actor_idcs, actor_ctrs, lane_graph):
         N, T ,_ = x.size()
-        
         expanded_shape = graph.ndata["shape"].unsqueeze(1).expand(N, T, 2).to(x.device)
 
         x = torch.cat([x, expanded_shape], dim=2)
         # [N, T, 5] --> [T, N, 5]
         x = x.transpose(1, 0).to(graph.ndata["ctrs"].device)
         h0 = torch.zeros(1, x.shape[1], self.h_dim_gru).to(x.device)
+        
         # x now contains the final hidden states of the GRU
-        _, out = self.feat_enc(x, h0)
+        _, out = self.feat_enc(x.float(), h0)
         out = out[0]
         
         # additive learnable embedding for agent type

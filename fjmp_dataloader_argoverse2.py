@@ -9,7 +9,7 @@ import re
 from pandas import read_csv
 from tqdm import tqdm
 import math
-import matplotlib.pyplot as plt
+from shapely.geometry import Polygon, Point
 from fjmp_utils import *
 from fjmp_metrics import *
 from pathlib import Path
@@ -49,7 +49,7 @@ class Argoverse2Dataset(Dataset):
             self.mapping = pickle.load(f)
 
         self.avg_agent_length = {
-            0: 4.0,
+            0: 3.8,
             1: 0.7,
             2: 2.0,
             3: 2.0,
@@ -57,7 +57,7 @@ class Argoverse2Dataset(Dataset):
         }
 
         self.avg_agent_width = {
-            0: 2.0,
+            0: 1.7,
             1: 0.7,
             2: 0.7,
             3: 0.7,
@@ -376,7 +376,7 @@ class Argoverse2Dataset(Dataset):
         ig_labels_sparse = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, 25)
         ig_labels_sparse = np.asarray(ig_labels_sparse, np.float32)
 
-        ig_labels_dense = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, FUTURE_LENGTH)
+        ig_labels_dense = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, 60)#turns out that if you make this number FUTURE_LENGTH=80 ocasionally, you just get too many cycles and it kills the dagification process
         ig_labels_dense = np.asarray(ig_labels_dense, np.float32)
 
         ig_labels_m2i = self.get_interaction_labels_m2i(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes)
@@ -420,6 +420,17 @@ class Argoverse2Dataset(Dataset):
         data['ig_labels_sparse'] = ig_labels_sparse
         data['ig_labels_dense'] = ig_labels_dense
         data['ig_labels_m2i'] = ig_labels_m2i
+
+        shapes = [] # we are adding the lengths and widths
+        for i in range(data['feat_locs'].shape[0]):
+            length = self.avg_agent_length[data['feat_agenttypes'][i, (PAST_LENGTH - 1), 0]]
+            width = self.avg_agent_width[data['feat_agenttypes'][i, (PAST_LENGTH - 1), 0]]
+            shapes.append(np.array([length, width]))
+        shapes = np.vstack(shapes)
+        shapes = np.expand_dims(shapes, axis=1)
+        shapes = np.repeat(shapes, PAST_LENGTH, axis=1)
+
+        data['feat_shapes'] = shapes # vehicle [length,width] (past)
 
         return data
 
@@ -699,6 +710,11 @@ class Argoverse2Dataset(Dataset):
         static_map_path = os.path.join(self.files, scene_directory, "log_map_archive_{}.json".format(scene_directory))
         static_map = ArgoverseStaticMap.from_json(Path(static_map_path))
 
+        drivable_areas_list = static_map.get_scenario_vector_drivable_areas()
+        drivable_polygons = []
+        for i in range(len(drivable_areas_list)):
+            drivable_polygons.append(Polygon(drivable_areas_list[i].xyz[:, :2]))
+
         lane_ids, ctrs, feats = [], [], []
         centerlines, left_boundaries, right_boundaries = [], [], []
         for lane_segment in static_map.vector_lane_segments.values():
@@ -813,6 +829,7 @@ class Argoverse2Dataset(Dataset):
         graph['suc_pairs'] = suc_pairs
         graph['left_pairs'] = left_pairs
         graph['right_pairs'] = right_pairs
+        graph['drivable_polygons'] = drivable_polygons
 
         for k1 in ['pre', 'suc']:
             for k2 in ['u', 'v']:

@@ -313,19 +313,19 @@ def preprocess(graph, cross_dist, cross_angle=None):
     # lanewise pre and suc connections
     if pre_suc_valid:
         pre = graph['pre_pairs'].new().float().resize_(num_lanes, num_lanes).zero_()
-        pre[graph['pre_pairs'][:, 0], graph['pre_pairs'][:, 1]] = 1
+        pre[graph['pre_pairs'][:, 0].long(), graph['pre_pairs'][:, 1].long()] = 1
         suc = graph['suc_pairs'].new().float().resize_(num_lanes, num_lanes).zero_()
-        suc[graph['suc_pairs'][:, 0], graph['suc_pairs'][:, 1]] = 1
+        suc[graph['suc_pairs'][:, 0].long(), graph['suc_pairs'][:, 1].long()] = 1
 
     # find left lane nodes
     pairs = graph['left_pairs']
     if len(pairs) > 0 and pre_suc_valid:
         mat = pairs.new().float().resize_(num_lanes, num_lanes).zero_()
-        mat[pairs[:, 0], pairs[:, 1]] = 1
+        mat[pairs[:, 0].long(), pairs[:, 1].long()] = 1
         mat = (torch.matmul(mat, pre) + torch.matmul(mat, suc) + mat) > 0.5
 
         left_dist = dist.clone()
-        mask = mat[lane_idcs[hi], lane_idcs[wi]].logical_not()
+        mask = mat[lane_idcs[hi].long(), lane_idcs[wi].long()].logical_not()
         left_dist[hi[mask], wi[mask]] = 1e6
         if cross_angle is not None:
             left_dist[hi[left_mask], wi[left_mask]] = 1e6
@@ -356,11 +356,11 @@ def preprocess(graph, cross_dist, cross_angle=None):
     pairs = graph['right_pairs']
     if len(pairs) > 0 and pre_suc_valid:
         mat = pairs.new().float().resize_(num_lanes, num_lanes).zero_()
-        mat[pairs[:, 0], pairs[:, 1]] = 1
+        mat[pairs[:, 0].long(), pairs[:, 1].long()] = 1
         mat = (torch.matmul(mat, pre) + torch.matmul(mat, suc) + mat) > 0.5
 
         right_dist = dist.clone()
-        mask = mat[lane_idcs[hi], lane_idcs[wi]].logical_not()
+        mask = mat[lane_idcs[hi].long(), lane_idcs[wi].long()].logical_not()
         right_dist[hi[mask], wi[mask]] = 1e6
         if cross_angle is not None:
             right_dist[hi[right_mask], wi[right_mask]] = 1e6
@@ -393,5 +393,5 @@ def preprocess(graph, cross_dist, cross_angle=None):
     out['idx'] = graph['idx']
     return out
 
-main()
+#main()
 

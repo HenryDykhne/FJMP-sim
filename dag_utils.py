@@ -2,6 +2,7 @@ import numpy, torch, dgl
 import networkx as nx 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import time
 
 def build_dag_graph(graph, config):
     edge_type = torch.argmax(graph.edata["edge_probs"], dim=1)
@@ -31,7 +32,7 @@ def build_dag_graph(graph, config):
 
     return dag_graph
 
-def prune_graph_johnson(dag_graph):
+def prune_graph_johnson(dag_graph, scene_idxs):
     """
     dag_graph: DGL graph with weighted edges
     graph contains edge property "edge_probs" which contains predicted probability of each edge type 
@@ -40,21 +41,51 @@ def prune_graph_johnson(dag_graph):
 
     Note that we can think of a batch of graphs as one big graph and apply the pruning procedure on the entire batch at once.
     """
+    while True:
+        # First identify cycles in graph
+        G = dgl.to_networkx(dag_graph.cpu(), node_attrs=None, edge_attrs=None)
+        cycles = nx.simple_cycles(G)
 
-    G = dgl.to_networkx(dag_graph.cpu(), node_attrs=None, edge_attrs=None)
-    cycles = nx.simple_cycles(G)
+        eids = []
+        count_cycles = 0
+        
+        start = time.time() #get rid of
+        for cycle in cycles:
+            out_cycle = torch.Tensor(cycle).to(dag_graph.device).long()
+            in_cycle = torch.roll(out_cycle, 1)
 
-    # First identify cycles in graph
-    eids = []
-    count_cycles = 0
-    for cycle in cycles:
-        out_cycle = torch.Tensor(cycle).to(dag_graph.device).long()
-        in_cycle = torch.roll(out_cycle, 1)
+            eids.append(dag_graph.edge_ids(in_cycle, out_cycle))
+            #if count_cycles > we keep this as an option if counting takes too long
 
-        eids.append(dag_graph.edge_ids(in_cycle, out_cycle))
+            count_cycles += 1
 
-        count_cycles += 1
-    print(count_cycles)
+            if count_cycles > 10000:
+                print('partial cull triggered')
+                break #this is in case there are so many cycles, that even just counting them could take too long. in this case, we just do a partial cull and then count again
+
+        if count_cycles > 100:#get rid of
+            print(time.time() - start)
+        #print(count_cycles, scene_idxs, flush=True)
+        
+        if count_cycles > 100:
+            start = time.time()
+            print(count_cycles)
+            # dirty cycle reduction for when johnsons algorithm would take way too long (generally bogs down when count_cycles > 10000)
+            # dirty cycle cutting just breaks all cycles by removing their least likely edge without checking if the removal of one edge might make the removal of another unnescesary. 
+            # its not pretty, but if we have that many cycles, then this scene is in a state that is already kind of useless for learning
+            to_remove = []
+            for eid in eids:
+                edge_probs_cycle = dag_graph.edata["edge_probs"][eid]
+                remove_eid = eid[torch.argmin(edge_probs_cycle)]  
+                to_remove.append(remove_eid)
+            
+            to_remove = torch.unique(torch.tensor(to_remove))
+            #print(to_remove)#get rid
+            dag_graph.remove_edges(to_remove.to(dag_graph.device))
+            print(time.time() - start)#get rid
+        else:
+            break #if the number of cycles remaining is reasonable, we break.
+        
 
     to_remove = []
     while len(eids) > 0:
