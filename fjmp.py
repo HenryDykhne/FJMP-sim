@@ -307,6 +307,7 @@ class FJMP(torch.nn.Module):
     def _train(self, train_loader, val_loader, optimizer, start_epoch, val_best, ade_best, fde_best, val_edge_acc_best):        
         hvd.broadcast_parameters(self.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+        print_('Starting from epoch: ', start_epoch)
         
         inner_loops = 0
         outer_loops = 0
@@ -404,8 +405,8 @@ class FJMP(torch.nn.Module):
                         # produces dictionary of results
                         res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=prop_ground_truth, eval=False, confidence_graph = confidence_graph, loop = start_timestep)
                         
-                        #steps_before_replan = torch.randint(1, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
-                        steps_before_replan = self.replan_frequency
+                        steps_before_replan = torch.randint(self.observation_steps, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
+                        #steps_before_replan = self.replan_frequency
                         #print(hvd.rank(), steps_before_replan)
                         loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], has_preds, gt_locs, gt_psirads, gt_vels, dd['batch_size'], dd["ig_labels"], epoch, steps = steps_before_replan)
                         
@@ -763,8 +764,8 @@ class FJMP(torch.nn.Module):
                         # produces dictionary of results
                         res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], actor_ctrs, prop_ground_truth=0., eval=True, confidence_graph = confidence_graph)
                         
-                        #steps_before_replan = torch.randint(1, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
-                        steps_before_replan = self.replan_frequency
+                        steps_before_replan = torch.randint(self.observation_steps, self.prediction_steps + 1, (1,)).item() #how much we step forward for this rollout (the rest of the prediction would in real life be thrown away, but we still attend to it in training)
+                        #steps_before_replan = self.replan_frequency
                         
                         loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], has_preds, gt_locs, gt_psirads, gt_vels, dd['batch_size'], dd["ig_labels"], epoch, steps = steps_before_replan)
 
