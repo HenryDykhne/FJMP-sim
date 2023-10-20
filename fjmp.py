@@ -449,7 +449,8 @@ class FJMP(torch.nn.Module):
 
                         probability = 1 - (epoch - 1) / (self.max_epochs - 1)   
                         use_gt = random.random() < probability
-                        if use_gt:
+                        #if use_gt:
+                        if True:
                             best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs (we anneal this)
                         else:
                             best = max_conf # then we switch to our confidence predictor to use the mode with the heighest confidence
@@ -803,7 +804,8 @@ class FJMP(torch.nn.Module):
                         
                         probability = 1 - (epoch - 1) / (self.max_epochs - 1)   
                         use_gt = random.random() < probability
-                        if use_gt:
+                        #if use_gt:
+                        if True:
                             best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs (we anneal this)
                         else:
                             best = max_conf # then we switch to our confidence predictor to use the mode with the heighest confidence
