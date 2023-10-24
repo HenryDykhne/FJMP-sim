@@ -63,11 +63,11 @@ def prune_graph_johnson(dag_graph, scene_idxs):
                 print('partial cull triggered')
                 break #this is in case there are so many cycles, that even just counting them could take too long. in this case, we just do a partial cull and then count again
 
-        if count_cycles > 100:#get rid of
+        if count_cycles > 1000:#get rid of
             print(time.time() - start)
         #print(count_cycles, scene_idxs, flush=True)
         
-        if count_cycles > 100:
+        if count_cycles > 1000:
             start = time.time()
             print(count_cycles)
             # dirty cycle reduction for when johnsons algorithm would take way too long (generally bogs down when count_cycles > 10000)

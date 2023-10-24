@@ -47,6 +47,7 @@ RUN APT_INSTALL="apt-get install -y --no-install-recommends" && \
         tree \
         unzip \
         unrar \
+        ffmpeg \
         && \
 
     DEBIAN_FRONTEND=noninteractive $APT_INSTALL \
