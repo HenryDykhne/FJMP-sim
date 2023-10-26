@@ -376,7 +376,7 @@ class Argoverse2Dataset(Dataset):
         ig_labels_sparse = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, 25)
         ig_labels_sparse = np.asarray(ig_labels_sparse, np.float32)
 
-        ig_labels_dense = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, 60)#turns out that if you make this number FUTURE_LENGTH=80 ocasionally, you just get too many cycles and it kills the dagification process
+        ig_labels_dense = self.get_interaction_labels_fjmp(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes, FUTURE_LENGTH)
         ig_labels_dense = np.asarray(ig_labels_dense, np.float32)
 
         ig_labels_m2i = self.get_interaction_labels_m2i(idx, ctrs, feat_locs, feat_vels, feat_psirads, has_obss, is_valid_agent, feat_agenttypes)

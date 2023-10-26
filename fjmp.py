@@ -42,6 +42,7 @@ parser.add_argument("--rel_coef", default=100, type=float, help="coefficient for
 parser.add_argument("--proposal_header", action="store_true", help="add proposal multitask training objective?")
 parser.add_argument("--two_stage_training", action="store_true", help="train relation predictor first?")
 parser.add_argument("--training_stage", default=1, type=int, help='1 or 2. Which training stage in 2 stage training?')
+parser.add_argument("--ts_finetune", action="store_true", help='switch to trafficsim finetuning stage?')
 parser.add_argument("--ig", choices=['sparse', 'dense', 'm2i'], help='which interaction graph pseudolabels to use', default="sparse")
 parser.add_argument("--focal_loss", action="store_true", help="use multiclass focal loss for relation header?")
 parser.add_argument("--gamma", default=5, type=float, help="gamma parameter for focal loss.")
@@ -110,6 +111,7 @@ class FJMP(torch.nn.Module):
         self.proposal_header = config["proposal_header"]
         self.two_stage_training = config["two_stage_training"]
         self.training_stage = config["training_stage"]
+        self.ts_finetune = config["ts_finetune"] = config["ts_finetune"] if ("ts_finetune" in config) else False #just cause im using a first stage that was trained before this was a feature, so the old config was loaded. #REMOVE AFTER RETRAINING STAGE 1
         self.ig = config["ig"]
         self.focal_loss = config["focal_loss"]
         self.gamma = config["gamma"]
@@ -359,7 +361,7 @@ class FJMP(torch.nn.Module):
                 #     break
                 dd = self.process(data)
 
-                if (self.two_stage_training and self.training_stage == 2):
+                if (self.two_stage_training and self.training_stage == 2 and self.ts_finetune):
                     collective_loss_dict = {}
                     collective_loss_dict["total_loss"] = torch.tensor(0.).to(dev)
                     collective_loss_dict["loss_reg"] = torch.tensor(0.).to(dev)
@@ -449,8 +451,7 @@ class FJMP(torch.nn.Module):
 
                         probability = 1 - (epoch - 1) / (self.max_epochs - 1)   
                         use_gt = random.random() < probability
-                        #if use_gt:
-                        if True:
+                        if use_gt:
                             best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs (we anneal this)
                         else:
                             best = max_conf # then we switch to our confidence predictor to use the mode with the heighest confidence
@@ -527,6 +528,8 @@ class FJMP(torch.nn.Module):
                     collective_loss_dict['total_loss'] = loss
                 else:
                     dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
+                    confidence_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
+                    
                     # only process observed features
                     dgl_graph = self.feature_encoder(dgl_graph, dd['feats'][:,:self.observation_steps], dd['agenttypes'], dd['actor_idcs'], dd['actor_ctrs'], dd['lane_graph'])
 
@@ -539,7 +542,7 @@ class FJMP(torch.nn.Module):
                     ig_dict["ig_labels"] = dd["ig_labels"] 
                     
                     # produces dictionary of results
-                    res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=prop_ground_truth, eval=False)
+                    res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=prop_ground_truth, confidence_graph = confidence_graph, eval=False)
 
                     loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'], dd['gt_locs'], None, None, dd['batch_size'], dd["ig_labels"], epoch)
                     
@@ -555,7 +558,7 @@ class FJMP(torch.nn.Module):
                 if i % 100 == 0:
                     if i == 0:
                         last = time.time()
-                    if (self.two_stage_training and self.training_stage == 2):                    
+                    if (self.two_stage_training and self.training_stage == 2 and self.ts_finetune):                    
                         print_("Training data: ", "{:.2f}%".format(i * 100 / tot_log), "lr={:.3e}".format(cur_lr), "rel_coef={:.1f}".format(self.rel_coef),
                             "\t".join([k + ":" + f"{v.item():.2f}" for k, v in collective_loss_dict.items()]), '\tavg_num_predictions: ' + f"{(inner_loops/outer_loops):.1f}", '\tseconds_taken: ', "{:.2f}".format(time.time() - last))
                         #print_('max_conf          ', max_conf, '\n', 'true best example', loss_dict['argmin'])
@@ -569,14 +572,13 @@ class FJMP(torch.nn.Module):
                     if self.proposal_header:
                         proposals_all.append(res["proposals"].detach().cpu())
                     
-                    if (self.two_stage_training and self.training_stage == 2):
+                    if (self.two_stage_training and self.training_stage == 2 and self.ts_finetune):
                         c_res = collective_res["loc_pred"][:, :self.prediction_steps].detach()
                         c_res = c_res.unsqueeze(2).repeat(1, 1, self.num_joint_modes, 1)
                         loc_preds.append(c_res.cpu())
                         ts_loss.append(collective_loss_dict['trafficsim_loss'].detach().cpu().reshape(1))
-                    
-                    if (not self.two_stage_training):
-                        loc_preds.append(res['loc_pred'].detach().cpu())
+                    elif (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):                    
+                        loc_preds.append(res["loc_pred"].detach().cpu())
                     
                     if self.learned_relation_header:
                         ig_preds.append(res["edge_probs"].detach().cpu())
@@ -634,7 +636,10 @@ class FJMP(torch.nn.Module):
                 if self.proposal_header:
                     results["proposals_all"] = np.concatenate(proposals_all, axis=0)
                 if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
-                    results['ts_loss'] = ts_loss
+                    if self.ts_finetune:
+                        results['ts_loss'] = ts_loss
+                    else:
+                        results['ts_loss'] = torch.tensor(np.inf)
                     results['loc_pred'] = np.concatenate(loc_preds, axis=0)    
                 if self.learned_relation_header:
                     results['ig_preds'] = np.concatenate(ig_preds, axis=0)
@@ -668,15 +673,26 @@ class FJMP(torch.nn.Module):
                 # Best model is one with minimum TS_LOSS
                 if hvd.rank() == 0:
                     if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
-                        if val_eval_results['TS_LOSS'].item() < val_best:
-                            val_best = val_eval_results['TS_LOSS'].item()
-                            ade_best = val_eval_results["ADE"]
-                            fde_best = val_eval_results["FDE"]
-                            print('test1')
-                            self.save(epoch, optimizer, val_best, ade_best, fde_best)
-                            print_("Validation TS_LOSS improved. Saving model. ")
-                        print_("Best TS_LOSS: {:.4f}".format(val_best), "Associated ADE: {:.3f}".format(ade_best), "Associated FDE: {:.3f}".format(fde_best))
 
+                        if not self.ts_finetune:
+                            if val_eval_results["ADE"] + val_eval_results["FDE"] < val_best:
+                                val_best = val_eval_results['TS_LOSS'].item()
+                                ade_best = val_eval_results["ADE"]
+                                fde_best = val_eval_results["FDE"]
+                                self.save(epoch, optimizer, val_best, ade_best, fde_best)
+                                print_("Validation FDE + ADE improved. Saving model. ")
+                        else:
+                            if val_eval_results['TS_LOSS'].item() < val_best:
+                                val_best = val_eval_results['TS_LOSS'].item()
+                                ade_best = val_eval_results["ADE"]
+                                fde_best = val_eval_results["FDE"]
+                                self.save(epoch, optimizer, val_best, ade_best, fde_best)
+                                print_("Validation TS_LOSS improved. Saving model. ")
+                        
+                        if self.ts_finetune:
+                            print_("Best TS_LOSS: {:.4f}".format(val_best), "Associated ADE: {:.3f}".format(ade_best), "Associated FDE: {:.3f}".format(fde_best))
+                        else:
+                            print_("Best FDE + ADE: {:.4f}".format(val_best), "Associated ADE: {:.3f}".format(ade_best), "Associated FDE: {:.3f}".format(fde_best))
                     else:
                         if val_eval_results["E-Acc"] > val_edge_acc_best:
                             print_("Validation Edge Accuracy improved.")  
@@ -721,7 +737,7 @@ class FJMP(torch.nn.Module):
                 #     break
                 dd = self.process(data)
 
-                if (self.two_stage_training and self.training_stage == 2):
+                if (self.two_stage_training and self.training_stage == 2 and self.ts_finetune):
                     collective_loss_dict = {}
                     collective_loss_dict["total_loss"] = torch.tensor(0.).to(dev)
                     collective_loss_dict["conf_loss"] = torch.tensor(0.).to(dev)
@@ -804,8 +820,7 @@ class FJMP(torch.nn.Module):
                         
                         probability = 1 - (epoch - 1) / (self.max_epochs - 1)   
                         use_gt = random.random() < probability
-                        #if use_gt:
-                        if True:
+                        if use_gt:
                             best = loss_dict['argmin'] #we use the best ground truth to train for the first few epochs (we anneal this)
                         else:
                             best = max_conf # then we switch to our confidence predictor to use the mode with the heighest confidence
@@ -885,6 +900,8 @@ class FJMP(torch.nn.Module):
                     collective_loss_dict['total_loss'] = loss
                 else:
                     dgl_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
+                    confidence_graph = self.init_dgl_graph(dd['batch_idxs'], dd['ctrs'], dd['orig'], dd['rot'], dd['shapes'][:,self.observation_steps-1], dd["agenttypes"], dd['world_locs'], dd['has_preds']).to(dev)
+                    
                     # only process observed features
                     dgl_graph = self.feature_encoder(dgl_graph, dd['feats'][:,:self.observation_steps], dd['agenttypes'], dd['actor_idcs'], dd['actor_ctrs'], dd['lane_graph'])
 
@@ -896,14 +913,15 @@ class FJMP(torch.nn.Module):
                     ig_dict = {}
                     ig_dict["ig_labels"] = dd["ig_labels"]
                     
-                    res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=0., eval=True)
+                    # produces dictionary of results
+                    res = self.forward(dd["scene_idxs"], dgl_graph, stage_1_graph, ig_dict, dd['batch_idxs'], dd["batch_idxs_edges"], dd["actor_ctrs"], prop_ground_truth=0., confidence_graph = confidence_graph, eval=True)
 
                     loss_dict = self.get_loss(dgl_graph, dd['batch_idxs'], res, dd['agenttypes'], dd['shapes'][:,self.observation_steps-1], dd['has_preds'], dd['gt_locs'], None, None, dd['batch_size'], dd["ig_labels"], epoch)
                 
                 if i % 50 == 0:
                     if i == 0:
                         last = time.time()
-                    if (self.two_stage_training and self.training_stage == 2):                    
+                    if (self.two_stage_training and self.training_stage == 2 and self.ts_finetune):                    
                         print_("Validation data: ", "{:.2f}%".format(i * 100 / tot_log), "\t".join([k + ":" + f"{v.item():.2f}" for k, v in collective_loss_dict.items()]), '\tseconds_taken: ', "{:.2f}".format(time.time() - last))
                     else:
                         print_("Validation data: ", "{:.2f}%".format(i * 100 / tot_log), "\t".join([k + ":" + f"{v.item():.2f}" for k, v in loss_dict.items()]), '\tseconds_taken: ', "{:.2f}".format(time.time() - last))
@@ -911,14 +929,13 @@ class FJMP(torch.nn.Module):
                 if self.proposal_header:
                     proposals_all.append(res["proposals"].detach().cpu())
                 
-                if (self.two_stage_training and self.training_stage == 2):
+                if (self.two_stage_training and self.training_stage == 2 and self.ts_finetune):
                     c_res = collective_res["loc_pred"][:, :self.prediction_steps].detach()
                     c_res = c_res.unsqueeze(2).repeat(1, 1, self.num_joint_modes, 1)
                     loc_preds.append(c_res.cpu())
                     ts_loss.append(collective_loss_dict['trafficsim_loss'].detach().cpu().reshape(1))
-
-                if (not self.two_stage_training):
-                    loc_preds.append(res['loc_pred'].detach().cpu())##hold on
+                elif (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):                    
+                    loc_preds.append(res["loc_pred"].detach().cpu())
 
                 is_connected_all.append(dd["is_connected"].detach().cpu())
 
@@ -970,7 +987,10 @@ class FJMP(torch.nn.Module):
         if self.proposal_header:
             results["proposals_all"] = np.concatenate(proposals_all, axis=0)
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
-            results['ts_loss'] = ts_loss
+            if self.ts_finetune:
+                results['ts_loss'] = ts_loss
+            else:
+                results['ts_loss'] = torch.tensor(np.inf)
             results['loc_pred'] = np.concatenate(loc_preds, axis=0)    
         if self.learned_relation_header:
             results['ig_preds'] = np.concatenate(ig_preds, axis=0)
@@ -1168,10 +1188,10 @@ class FJMP(torch.nn.Module):
         
         if (not self.two_stage_training) or (self.two_stage_training and self.training_stage == 2):
             temp_g = prune_graph_johnson(dag_graph, scene_idxs)
-            if temp_g == None:
-                print(loop)
-                self.viz_interaction_graph(dag_graph, 0)
-                exit()
+            # if temp_g == None:
+            #     print(loop)
+            #     self.viz_interaction_graph(dag_graph, 0)
+            #     exit()
             dag_graph = temp_g
         
         if self.proposal_header:
@@ -1513,6 +1533,8 @@ class FJMP(torch.nn.Module):
 
             else:
                 loss = loss_reg
+                if not self.ts_finetune:
+                    loss += conf_loss
 
                 if self.proposal_header:
                     loss = loss + loss_prop_reg * self.proposal_coef
@@ -1530,7 +1552,10 @@ class FJMP(torch.nn.Module):
 
     def save_current_epoch(self, epoch, optimizer, val_best, ade_best, fde_best):
         # save best model to pt file
-        path = self.log_path / "current_model_{}.pt".format(epoch)
+        if self.ts_finetune:
+            path = self.log_path / "current_model_ts_{}.pt".format(epoch)
+        else:
+            path = self.log_path / "current_model_{}.pt".format(epoch)
         state = {
             'epoch': epoch,
             'state_dict': self.state_dict(),
@@ -1543,7 +1568,10 @@ class FJMP(torch.nn.Module):
 
     def save(self, epoch, optimizer, val_best, ade_best, fde_best):
         # save best model to pt file
-        path = self.log_path / "best_model.pt"
+        if self.ts_finetune:
+            path = self.log_path / "best_model_ts.pt"
+        else:
+            path = self.log_path / "best_model.pt"
         state = {
             'epoch': epoch,
             'state_dict': self.state_dict(),
@@ -1581,10 +1609,22 @@ class FJMP(torch.nn.Module):
     
     def load_for_train(self, optimizer):
         # load best model from pt file
-        path = self.log_path / "best_model.pt"
+        ts_path = self.log_path / "best_model_ts.pt"
+        first_finetuning_epoch = False
+        if self.ts_finetune and os.path.exists(ts_path):
+            path = ts_path
+        else:
+            path = self.log_path / "best_model.pt"
+            first_finetuning_epoch = True
+
+
         state = torch.load(path, map_location=dev)
         self.load_state_dict(state['state_dict'])
         optimizer.load_state_dict(state['optimizer'])
+
+        if first_finetuning_epoch:
+            state['epoch'] = 0
+            state['val_best'] = np.inf
 
         return optimizer, state['epoch'] + 1, state['val_best'], state['ade_best'], state['fde_best']
 
@@ -1602,7 +1642,12 @@ class FJMP(torch.nn.Module):
 
     def load_for_eval(self):
         # load best model from pt file
-        path = self.log_path / "best_model.pt"
+        ts_path = self.log_path / "best_model_ts.pt"
+        if self.ts_finetune and os.path.exists(ts_path):
+            path = ts_path
+        else:
+            path = self.log_path / "best_model.pt"
+
         state = torch.load(path, map_location=dev)
         self.load_state_dict(state['state_dict'])
 
@@ -1680,6 +1725,7 @@ if __name__ == '__main__':
     config["proposal_header"] = args.proposal_header
     config["two_stage_training"] = args.two_stage_training
     config["training_stage"] = args.training_stage
+    config["ts_finetune"] = args.ts_finetune
     config["ig"] = args.ig
     config["focal_loss"] = args.focal_loss 
     config["gamma"] = args.gamma
@@ -1861,7 +1907,7 @@ if __name__ == '__main__':
         starting_epoch = 1 
         val_best, ade_best, fde_best, val_edge_acc_best = np.inf, np.inf, np.inf, 0.
         # resume training from checkpoint
-        if config["resume_training"]:
+        if config["resume_training"] or config['ts_finetune']:
             if (not model.two_stage_training) or (model.two_stage_training and model.training_stage == 2):
                 optimizer, starting_epoch, val_best, ade_best, fde_best = model.load_for_train(optimizer)
             else:
