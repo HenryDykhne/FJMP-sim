@@ -357,8 +357,8 @@ class FJMP(torch.nn.Module):
             for i, data in enumerate(train_loader): 
                 #random.seed(hvd.rank() * 100 + i * 10)
                 # get data dictionary for processing batch
-                # if i > 5:
-                #     break
+                if i > 5:
+                    break
                 dd = self.process(data)
 
                 if (self.two_stage_training and self.training_stage == 2 and self.ts_finetune):
@@ -676,7 +676,7 @@ class FJMP(torch.nn.Module):
 
                         if not self.ts_finetune:
                             if val_eval_results["ADE"] + val_eval_results["FDE"] < val_best:
-                                val_best = val_eval_results['TS_LOSS'].item()
+                                val_best = val_eval_results["ADE"] + val_eval_results["FDE"]
                                 ade_best = val_eval_results["ADE"]
                                 fde_best = val_eval_results["FDE"]
                                 self.save(epoch, optimizer, val_best, ade_best, fde_best)

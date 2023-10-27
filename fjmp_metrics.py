@@ -343,7 +343,7 @@ def calc_metrics(results, config, mask, identifier):
             smr_av2 = 0
             
         # [N, 30, 6, 2]
-        mse_error = (loc_pred - gt_locs_all)**2
+        mse_error = (loc_pred[:60] - gt_locs_all[:60])**2#undoo the [:60] its only for test
         # [N, 30, 6]
         euclidean_rmse = np.sqrt(mse_error.sum(-1))   
         
