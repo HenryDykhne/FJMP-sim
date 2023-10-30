@@ -102,7 +102,7 @@ RUN APT_INSTALL="apt-get install -y --no-install-recommends" && \
 # ------------------------------------------------------------------
 
     $PIP_INSTALL \
-        setuptools==66.0.0 \
+        setuptools==59.5.0 \
         future==0.18.3 \
         typing==3.7.4.3 \
         Cython==0.29.33 \

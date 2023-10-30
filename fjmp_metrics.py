@@ -267,14 +267,18 @@ def calc_metrics(results, config, mask, identifier):
     gt_vels_all = results['gt_vels_all'][mask]
     theta_all = results['theta_all'][mask]
     ctrs_all = results['gt_ctrs_all'][mask]
-    if config['dataset'] == "interaction":
-        shapes_all = results['shapes_all'][mask]
+    #if config['dataset'] == "interaction":
+    shapes_all = results['shapes_all'][mask]
     if config['proposal_header']:
         proposals = results["proposals_all"][mask]
     if (not config['two_stage_training']) or (config['two_stage_training'] and config['training_stage'] == 2):
-        loc_pred = results['loc_pred'][mask]  
+        loc_pred = results['loc_pred'][mask]
+        head_pred = results['head_pred'][mask]  
+        vel_pred = results['vel_pred'][mask]  
+        correct_conf_percentage = results['correct_conf_percentage']
         if config['ts_finetune']:
             ts_loss = results['ts_loss']
+        tot_loss = results['total_loss']
     
     n_scenarios = np.unique(batch_idxs).shape[0]
     scenarios = np.unique(batch_idxs).astype(int)
@@ -330,8 +334,10 @@ def calc_metrics(results, config, mask, identifier):
         # [N, 30, 6, 2]
         num_joint_modes = loc_pred.shape[2]
         gt_locs_all = np.stack([gt_locs_all]*num_joint_modes, axis=2)
+        gt_psirads_all = np.stack([gt_psirads_all]*num_joint_modes, axis=2)
+        gt_vels_all = np.stack([gt_vels_all]*num_joint_modes, axis=2)
 
-        if config['dataset'] == 'interaction' and config['mode'] == 'eval' and identifier == 'reg':
+        if config['mode'] == 'eval' and identifier == 'reg':
             scr = compute_scene_collision_rate(n_scenarios, loc_pred, batch_idxs, theta_all, feat_psirads_all, shapes_all, ctrs_all, gt_locs_all)
         else:
             scr=0
@@ -343,29 +349,54 @@ def calc_metrics(results, config, mask, identifier):
             smr_av2 = 0
             
         # [N, 30, 6, 2]
-        mse_error = (loc_pred[:60] - gt_locs_all[:60])**2#undoo the [:60] its only for test
+        
+        mse_error = (loc_pred - gt_locs_all)**2
+        head_pred = torch.tensor(head_pred)
+        head_pred = torch.atan2(head_pred[:, :, :, 1], head_pred[:, :, :, 0]).unsqueeze(3).detach().cpu().numpy()
+        mse_error_head = (((head_pred - gt_psirads_all)+math.pi)%(2 * math.pi)-math.pi)**2
+        mse_error_vel = (vel_pred - gt_vels_all)**2
         # [N, 30, 6]
-        euclidean_rmse = np.sqrt(mse_error.sum(-1))   
+        euclidean_rmse = np.sqrt(mse_error.sum(-1))
+        euclidean_rmse_head = np.sqrt(mse_error_head.sum(-1))
+        euclidean_rmse_vel = np.sqrt(mse_error_vel.sum(-1))
+
         
         euclidean_rmse_filtered = np.zeros(euclidean_rmse.shape)
+        euclidean_rmse_filtered_head = np.zeros(euclidean_rmse_head.shape)
+        euclidean_rmse_filtered_vel = np.zeros(euclidean_rmse_vel.shape)
+
         euclidean_rmse_filtered[has_preds_all_mask] = euclidean_rmse[has_preds_all_mask]
+        euclidean_rmse_filtered_head[has_preds_all_mask] = euclidean_rmse_head[has_preds_all_mask]
+        euclidean_rmse_filtered_vel[has_preds_all_mask] = euclidean_rmse_vel[has_preds_all_mask]
     
         # mean over the agents then min over the num_joint_modes samples then mean over the scenarios
         mean_FDE = np.zeros((n_scenarios, num_joint_modes))
         mean_ADE = np.zeros((n_scenarios, num_joint_modes))
+        mean_AHE = np.zeros((n_scenarios, num_joint_modes))
+        mean_AVE = np.zeros((n_scenarios, num_joint_modes))
         
         for j, i in enumerate(scenarios):
             i = int(i)
             has_preds_all_i = has_preds_all[batch_idxs == i]
             euclidean_rmse_filtered_i = euclidean_rmse_filtered[batch_idxs == i]
+            euclidean_rmse_filtered_head_i = euclidean_rmse_filtered_head[batch_idxs == i]
+            euclidean_rmse_filtered_vel_i = euclidean_rmse_filtered_vel[batch_idxs == i]
             mean_FDE[j] = euclidean_rmse_filtered_i[:, -1].mean(0)
             mean_ADE[j] = euclidean_rmse_filtered_i.sum((0, 1)) / has_preds_all_i.sum()
+            mean_AHE[j] = euclidean_rmse_filtered_head_i.sum((0, 1)) / has_preds_all_i.sum()
+            mean_AVE[j] = euclidean_rmse_filtered_vel_i.sum((0, 1)) / has_preds_all_i.sum()
         
         if identifier == 'reg':
             FDE = mean_FDE.min(1).mean()
             ADE = mean_ADE.min(1).mean()
+            AHE = mean_AHE.min(1).mean()
+            AVE = mean_AVE.min(1).mean()
+
+            ccp = correct_conf_percentage
+            
             if config['ts_finetune']:
                 TS_LOSS = torch.cat(ts_loss).mean()
+            tot_loss = torch.cat(tot_loss).mean()
 
             # initialize to -1
             best_modes = np.ones(n_scenes_before_mask) * -1
@@ -383,6 +414,9 @@ def calc_metrics(results, config, mask, identifier):
         # default values for when training stage = 1
         FDE = 0
         ADE = 0
+        AHE = 0
+        AVE = 0
+        ccp = 0
         scr = 0
         smr = 0
         smr_av2 = 0
@@ -407,6 +441,8 @@ def calc_metrics(results, config, mask, identifier):
     results = {
         "FDE": FDE,
         "ADE": ADE,
+        "AHE": AHE,
+        "AVE": AVE,
         "TS_LOSS": TS_LOSS}
 
     if config["proposal_header"] and identifier == 'reg':
@@ -417,7 +453,9 @@ def calc_metrics(results, config, mask, identifier):
         results["pADE"] = 0
     
     results["n_scenarios"] = n_scenarios
+    results["total_loss"] = tot_loss
     results["SCR"] = scr 
+    results["CCP"] = ccp 
     results["SMR"] = smr
     results["SMR_AV2"] = smr_av2
 

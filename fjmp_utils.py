@@ -74,6 +74,10 @@ def sync(data, config, comm):
     
     FDE = 0
     ADE = 0
+    AHE = 0
+    AVE = 0
+    CCP = 0
+    total_loss = 0
     TS_LOSS = 0
     SCR = 0
     SMR = 0
@@ -84,7 +88,11 @@ def sync(data, config, comm):
     for i in range(len(data_list)):
         FDE += data_list[i]['FDE'] * data_list[i]['n_scenarios']
         ADE += data_list[i]['ADE'] * data_list[i]['n_scenarios']
+        AHE += data_list[i]['AHE'] * data_list[i]['n_scenarios']
+        AVE += data_list[i]['AVE'] * data_list[i]['n_scenarios']
+        CCP += data_list[i]['CCP'] * data_list[i]['n_scenarios']
         TS_LOSS += data_list[i]['TS_LOSS'] * data_list[i]['n_scenarios']
+        total_loss += data_list[i]['total_loss'] * data_list[i]['n_scenarios']
         SCR += data_list[i]['SCR'] * data_list[i]['n_scenarios']
         SMR += data_list[i]['SMR'] * data_list[i]['n_scenarios']
         SMR_AV2 += data_list[i]['SMR_AV2'] * data_list[i]['n_scenarios']
@@ -94,6 +102,10 @@ def sync(data, config, comm):
     
     FDE /= n_scenarios
     ADE /= n_scenarios
+    AHE /= n_scenarios
+    AVE /= n_scenarios
+    CCP /= n_scenarios
+    total_loss /= n_scenarios
     TS_LOSS /= n_scenarios
     SCR /= n_scenarios
     SMR /= n_scenarios
@@ -125,6 +137,10 @@ def sync(data, config, comm):
     return_dict = {
         'FDE': FDE,
         'ADE': ADE,
+        'AHE': AHE,
+        'AVE': AVE,
+        'CCP': CCP.item(),
+        'total_loss': total_loss,
         'TS_LOSS': TS_LOSS,
         'pFDE': pFDE,
         'pADE': pADE,
